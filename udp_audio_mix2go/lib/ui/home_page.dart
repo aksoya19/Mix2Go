@@ -1,21 +1,18 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import '../network/udp_receiver.dart';
-import '../audio/audio_buffer.dart';
 import '../audio/audio_player.dart';
+import '../audio/audio_source.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
-
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-  final receiver = UdpReceiver();
-  final buffer = AudioBuffer();
   final player = AudioPlayerEngine();
+  final source = AudioSource();
 
+  Timer? timer;
   bool running = false;
 
   @override
@@ -24,37 +21,34 @@ class _HomePageState extends State<HomePage> {
     player.init();
   }
 
-  void start() async {
-    setState(() => running = true);
+  void start() {
+    running = true;
 
-    await receiver.start((packet) {
-      buffer.add(packet);
-    });
-
-    Timer.periodic(const Duration(milliseconds: 5), (_) async {
+    timer = Timer.periodic(const Duration(milliseconds: 20), (_) {
       if (!running) return;
-      final data = buffer.next();
-      if (data != null) {
-        await player.play(data);
-      }
+      final packet = source.getNextPacket();
+      player.play(packet);
     });
+
+    setState(() {});
   }
 
   void stop() {
-    setState(() => running = false);
-    receiver.stop();
+    running = false;
+    timer?.cancel();
+    setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Mix2Go – Receiver")),
+      appBar: AppBar(title: const Text("Mix2Go – Audio Test")),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Text(
-              running ? "Empfängt Audio…" : "Nicht verbunden",
+              running ? "Testton läuft" : "Gestoppt",
               style: const TextStyle(fontSize: 18),
             ),
             const SizedBox(height: 20),
