@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import '../audio/audio_player.dart';
-import '../audio/audio_source.dart';
+import '../audio/audio_manager.dart';
 
 class HomePage extends StatefulWidget {
   @override
@@ -9,54 +8,114 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final player = AudioPlayerEngine();
-  final source = AudioSource();
+  final AudioManager _audioManager = AudioManager();
+  final TextEditingController _portController = TextEditingController(text: "5000");
 
-  Timer? timer;
-  bool running = false;
+  String _statusMessage = "Bereit";
+  bool _isRunning = false;
 
   @override
   void initState() {
     super.initState();
-    player.init();
-  }
-
-  void start() {
-    running = true;
-
-    timer = Timer.periodic(const Duration(milliseconds: 20), (_) {
-      if (!running) return;
-      final packet = source.getNextPacket();
-      player.play(packet);
+    
+    // Listen to state changes
+    _audioManager.stateStream.listen((state) {
+      if (!mounted) return;
+      setState(() {
+        switch (state) {
+          case AudioState.stopped:
+            _isRunning = false;
+            _statusMessage = "Gestoppt";
+            break;
+          case AudioState.buffering:
+             _isRunning = true;
+            _statusMessage = "Pufferung...";
+            break;
+          case AudioState.playing:
+             _isRunning = true;
+            _statusMessage = "Gibt Audio wieder";
+            break;
+          case AudioState.error:
+             _isRunning = false;
+            _statusMessage = "Ein Fehler ist aufgetreten";
+            break;
+        }
+      });
     });
 
-    setState(() {});
+    // Listen to logs for more details (optional, but good for debug)
+    _audioManager.logStream.listen((log) {
+      print("AudioLog: $log");
+      // Optional: Update status with log if it's not just a state change
+      if (_audioManager.currentState == AudioState.error) {
+         if (mounted) setState(() => _statusMessage = log);
+      }
+    });
   }
 
-  void stop() {
-    running = false;
-    timer?.cancel();
-    setState(() {});
+  @override
+  void dispose() {
+    _audioManager.dispose();
+    _portController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _toggleStart() async {
+    if (_isRunning) {
+      await _audioManager.stop();
+    } else {
+      final port = int.tryParse(_portController.text);
+      if (port == null) {
+        setState(() => _statusMessage = "Ungültiger Port");
+        return;
+      }
+      await _audioManager.start(port);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Mix2Go – Audio Test")),
+      appBar: AppBar(title: const Text("Mix2Go – Audio Receiver")),
       body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              running ? "Testton läuft" : "Gestoppt",
-              style: const TextStyle(fontSize: 18),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: running ? stop : start,
-              child: Text(running ? "Stop" : "Start"),
-            ),
-          ],
+        child: Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                _statusMessage,
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 20),
+              TextField(
+                controller: _portController,
+                decoration: const InputDecoration(
+                  labelText: "Port",
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: TextInputType.number,
+                enabled: !_isRunning,
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton(
+                onPressed: _toggleStart,
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
+                  backgroundColor: _isRunning ? Colors.red : Theme.of(context).primaryColor,
+                  foregroundColor: Colors.white,
+                ),
+                child: Text(
+                  _isRunning ? "Stop" : "Empfang Starten",
+                  style: const TextStyle(fontSize: 18),
+                ),
+              ),
+              const SizedBox(height: 10),
+              if (_isRunning)
+                const CircularProgressIndicator()
+            ],
+          ),
         ),
       ),
     );

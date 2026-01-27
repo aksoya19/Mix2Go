@@ -3,11 +3,12 @@ import 'dart:typed_data';
 
 class AudioBuffer {
   final Queue<Uint8List> _queue = Queue();
-  final int maxPackets = 50;
+  final int maxPackets = 50; 
+  final int preBufferThreshold = 10; // Start playing only after we have this many packets
 
   void add(Uint8List data) {
     if (_queue.length >= maxPackets) {
-      _queue.removeFirst();
+      _queue.removeFirst(); // Drop oldest if full (overflow protection)
     }
     _queue.addLast(data);
   }
@@ -16,4 +17,12 @@ class AudioBuffer {
     if (_queue.isEmpty) return null;
     return _queue.removeFirst();
   }
+
+  void clear() {
+    _queue.clear();
+  }
+
+  bool get isReadyToPlay => _queue.length >= preBufferThreshold;
+  bool get hasData => _queue.isNotEmpty;
+  int get length => _queue.length;
 }

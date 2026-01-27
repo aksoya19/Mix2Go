@@ -10,8 +10,11 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  flutter_sound: ^9.3.12
+
+
   udp: ^5.0.3
+  mp_audio_stream: ^0.2.2
+
 
 dev_dependencies:
   flutter_test:
