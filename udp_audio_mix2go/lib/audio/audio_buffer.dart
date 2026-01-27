@@ -8,7 +8,7 @@ class AudioBuffer {
 
   void add(Uint8List data) {
     if (_queue.length >= maxPackets) {
-      _queue.removeFirst(); // Drop oldest if full (overflow protection)
+      _queue.removeFirst();  // Löscht das letzte Packet, wenns voll ist (overflow protection)
     }
     _queue.addLast(data);
   }
