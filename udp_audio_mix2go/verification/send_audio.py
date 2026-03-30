@@ -1,70 +1,88 @@
-import socket
-import math
-import struct
-import time
-import argparse
+"""
+Send UDP audio packets in the JUCE Mix2Go protocol format.
 
-def generate_sine_wave(frequency=440, sample_rate=44100, duration=1.0):
-    num_samples = int(sample_rate * duration)
-    # Stereo: 2 channels
-    data = bytearray()
-    for i in range(num_samples):
-        t = float(i) / sample_rate
-        value = int(16000.0 * math.sin(2.0 * math.pi * frequency * t))
-        # Clamp value
-        value = max(-32768, min(32767, value))
-        # Pack as little-endian 16-bit signed integer, twice for stereo
-        packed = struct.pack('<hh', value, value)
-        data.extend(packed)
-    return data
+Header (26 bytes, little-endian):
+  uint32 magic       = 0x4D324730  ("M2G0")
+  uint32 sampleRate  = 44100
+  uint16 numChannels = 2
+  uint32 numSamples
+  uint64 timestamp   (microseconds)
+  uint32 sequenceNumber
+
+Payload:
+  interleaved float32 [L, R, L, R, ...]
+"""
+import socket, math, struct, time, argparse
+
+MAGIC = 0x4D324730
+SAMPLE_RATE = 44100
+NUM_CHANNELS = 2
+
+def build_packet(float_samples, seq_num):
+    """Wrap interleaved float32 samples in a JUCE header."""
+    num_samples = len(float_samples) // NUM_CHANNELS
+    timestamp = int(time.time() * 1_000_000)  # µs
+
+    header = struct.pack('<I I H I Q I',
+        MAGIC,
+        SAMPLE_RATE,
+        NUM_CHANNELS,
+        num_samples,
+        timestamp,
+        seq_num,
+    )
+    payload = struct.pack(f'<{len(float_samples)}f', *float_samples)
+    return header + payload
+
+
+def generate_sine(frequency, duration_sec, amplitude=0.4):
+    """Return interleaved [L,R,L,R,...] float list."""
+    n = int(SAMPLE_RATE * duration_sec)
+    out = []
+    for i in range(n):
+        t = i / SAMPLE_RATE
+        v = amplitude * math.sin(2.0 * math.pi * frequency * t)
+        out.append(v)  # L
+        out.append(v)  # R
+    return out
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Send UDP Audio')
-    parser.add_argument('--ip', default='127.0.0.1', help='Target IP')
-    parser.add_argument('--port', type=int, default=5000, help='Target Port')
+    parser = argparse.ArgumentParser(description='Send JUCE-format UDP audio')
+    parser.add_argument('--ip',   default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=12345)
     args = parser.parse_args()
 
-    target_ip = args.ip
-    target_port = args.port
-
-    print(f"Generating audio with beep-pause pattern...")
-    
-    # 2.0 second beep, 2.0 second silence
-    beep_data = generate_sine_wave(duration=2.0, frequency=440)
-    silence_data = generate_sine_wave(duration=2.0, frequency=0) # 0 Hz = silence
-    
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    packet_size = 1024 # Payload size in bytes (256 samples stereo)
+    # Samples per packet (per channel). 256 is a typical JUCE block size.
+    BLOCK_SIZE = 256
+    samples_per_packet = BLOCK_SIZE * NUM_CHANNELS  # interleaved count
 
-    # Send loop
+    # Pre-generate 2 s beep + 2 s silence
+    beep    = generate_sine(440, 2.0)
+    silence = [0.0] * (SAMPLE_RATE * 2 * NUM_CHANNELS)
+
+    seq = 0
+    print(f"Sending to {args.ip}:{args.port}  (Ctrl-C to stop)")
+
     try:
         while True:
-            # Send Beep
-            print("Beep...")
-            send_chunk(sock, beep_data, target_ip, target_port, packet_size)
-            
-            # Send Silence (or just pause sending if we want to simulate network gap, 
-            # but for streaming, sending silence is better to keep clock sync if player expects stream)
-            # User said "not so many" waves, maybe they mean pause sending. 
-            # But continuous stream expects data. Let's send silence.
-            print("Silence...")
-            send_chunk(sock, silence_data, target_ip, target_port, packet_size)
-            
+            for label, data in [("Beep", beep), ("Silence", silence)]:
+                print(label)
+                off = 0
+                while off < len(data):
+                    chunk = data[off : off + samples_per_packet]
+                    pkt = build_packet(chunk, seq)
+                    sock.sendto(pkt, (args.ip, args.port))
+                    seq += 1
+                    off += samples_per_packet
+                    # Sleep to match real-time
+                    time.sleep(BLOCK_SIZE / SAMPLE_RATE)
     except KeyboardInterrupt:
         print("Stopped.")
     finally:
         sock.close()
 
-def send_chunk(sock, data, ip, port, packet_size):
-    samples_per_packet = packet_size // 4
-    packet_duration = samples_per_packet / 44100.0
-    
-    offset = 0
-    while offset < len(data):
-        chunk = data[offset:offset+packet_size]
-        sock.sendto(chunk, (ip, port))
-        offset += packet_size
-        time.sleep(packet_duration)
 
 if __name__ == "__main__":
     main()

@@ -44,15 +44,17 @@ class AudioPlayerEngine {
     _isPlayerRunning = false;
   }
 
+  /// Feed raw PCM16 bytes (Int16 little-endian) – used by the sine-wave test path.
   Future<void> feed(Uint8List data) async {
     if (!_isPlayerRunning) return;
-    
-    // mp_audio_stream expects Float32List.
-    // Our input is Uint8List which contains Int16 samples (Little Endian).
-    final floatCunks = _convertInt16ToFloat32(data);
-    
-    // push expects Float32List
-    _audioStream?.push(floatCunks);
+    _audioStream?.push(_convertInt16ToFloat32(data));
+  }
+
+  /// Feed Float32 samples directly – used by the JUCE UDP path.
+  /// [samples] must be interleaved [L, R, L, R, ...] in the range [-1.0, 1.0].
+  void feedFloat32(Float32List samples) {
+    if (!_isPlayerRunning) return;
+    _audioStream?.push(samples);
   }
 
   // Convert raw bytes (Int16) to Float32 (-1.0 to 1.0)

@@ -9,7 +9,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final AudioManager _audioManager = AudioManager();
-  final TextEditingController _portController = TextEditingController(text: "5000");
+  final TextEditingController _portController = TextEditingController(text: "12345");
 
   String _statusMessage = "Bereit";
   bool _isRunning = false;
