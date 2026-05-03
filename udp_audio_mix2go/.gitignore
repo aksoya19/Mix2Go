@@ -1,3 +1,6 @@
+# IDE
+.vs/
+
 # Miscellaneous
 *.class
 *.log
