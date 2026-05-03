@@ -16,7 +16,7 @@ class AudioPlayerEngine {
   Future<void> init({int sampleRate = 44100, int channels = 2}) async {
     if (_isPlayerRunning) return;
 
-    _audioStream ??= getAudioStream();
+    _audioStream = getAudioStream();
 
     try {
       _audioStream!.init(
@@ -43,6 +43,10 @@ class AudioPlayerEngine {
   }
 
   Future<void> stopStream() async {
+    try {
+      _audioStream?.uninit();
+    } catch (_) {}
+    _audioStream = null;
     _isPlayerRunning = false;
     print('[Player] Stream stopped');
   }
@@ -73,6 +77,10 @@ class AudioPlayerEngine {
   }
 
   void dispose() {
+    try {
+      _audioStream?.uninit();
+    } catch (_) {}
+    _audioStream = null;
     _isPlayerRunning = false;
   }
 }
