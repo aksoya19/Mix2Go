@@ -7,13 +7,15 @@ enum AudioState { stopped, buffering, playing, error }
 
 /// Orchestrates UDP reception → jitter buffer → audio playback.
 ///
-/// Playback is driven by the packet arrival rate, not by a timer.
-/// Each incoming packet triggers a drain of the jitter buffer up to
-/// (latestSeq - _kWindowAhead), so [mp_audio_stream]'s ring buffer is
-/// filled at exactly the network rate with no platform timer dependency.
+/// Consumption is driven by a [Timer.periodic] that ticks at the sender's
+/// packet rate (e.g. 5 ms for 220 samples @ 44100 Hz).  The network receive
+/// path only enqueues packets and tracks the latest sequence number — it never
+/// pushes audio directly.  This decouples the output rate from network jitter,
+/// preventing the burst-then-starve pattern that occurs over WireGuard/Tailscale
+/// tunnels.
 class AudioManager {
-  // Jitter window: how many packets behind the receive frontier we consume.
-  // Packets arriving up to this many slots late are still served in order.
+  // Jitter window: consume up to (latestSeq - _kWindowAhead) per tick so that
+  // packets arriving up to this many slots late are still served in order.
   static const int _kWindowAhead = 3;
 
   final AudioPlayerEngine _player = AudioPlayerEngine();
@@ -36,6 +38,8 @@ class AudioManager {
   bool _playerStarting = false;
   int? _latestSeq;
   int _consecutiveSilence = 0;
+
+  Timer? _drainTimer;
 
   // ── Public API ────────────────────────────────────────────────────────────
 
@@ -60,6 +64,8 @@ class AudioManager {
   }
 
   Future<void> stop() async {
+    _drainTimer?.cancel();
+    _drainTimer = null;
     _jitterBuffer.reset();
     _receiver.stop();
     await _player.stopStream();
@@ -73,6 +79,8 @@ class AudioManager {
 
   void dispose() {
     _isDisposed = true;
+    _drainTimer?.cancel();
+    _drainTimer = null;
     stop();
     _player.dispose();
     _stateController.close();
@@ -90,16 +98,17 @@ class AudioManager {
     // Start the player once the pre-buffer is filled.
     if (!_playerStarted && !_playerStarting && _jitterBuffer.isReady) {
       _playerStarting = true;
-      _initPlayer(packet.sampleRate, packet.numChannels);
-      return;
-    }
-
-    if (_playerStarted) {
-      _drainUpTo(packet.sequenceNumber - _kWindowAhead);
+      _initPlayer(packet.sampleRate, packet.numChannels, packet.numSamples);
     }
   }
 
-  // ── Arrival-driven drain ──────────────────────────────────────────────────
+  // ── Timer-driven drain ────────────────────────────────────────────────────
+
+  void _onDrainTick(Timer _) {
+    final latest = _latestSeq;
+    if (latest == null) return;
+    _drainUpTo(latest - _kWindowAhead);
+  }
 
   /// Feed all buffered frames whose sequence number is ≤ [maxSeq] to the
   /// audio player.  Gaps in the sequence are filled with silence.
@@ -131,7 +140,7 @@ class AudioManager {
 
   // ── Player initialisation ─────────────────────────────────────────────────
 
-  Future<void> _initPlayer(int sampleRate, int channels) async {
+  Future<void> _initPlayer(int sampleRate, int channels, int numSamples) async {
     try {
       await _player.startStream(sampleRate: sampleRate, channels: channels);
 
@@ -142,9 +151,16 @@ class AudioManager {
       }
 
       _playerStarted = true;
+
+      final intervalMs = (numSamples * 1000 / sampleRate).round().clamp(1, 100);
+      _drainTimer = Timer.periodic(
+        Duration(milliseconds: intervalMs),
+        _onDrainTick,
+      );
+
       _log(
         'Jitter buffer ready — sr=$sampleRate  ch=$channels  '
-        'window=$_kWindowAhead packets',
+        'interval=${intervalMs}ms  window=$_kWindowAhead packets',
       );
       _updateState(AudioState.playing);
     } catch (e) {
