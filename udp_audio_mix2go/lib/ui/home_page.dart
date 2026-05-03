@@ -3,13 +3,17 @@ import 'package:flutter/material.dart';
 import '../audio/audio_manager.dart';
 
 class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
   final AudioManager _audioManager = AudioManager();
-  final TextEditingController _portController = TextEditingController(text: "12345");
+  final TextEditingController _portController = TextEditingController(
+    text: "12345",
+  );
 
   String _statusMessage = "Bereit";
   bool _isRunning = false;
@@ -17,7 +21,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    
+
     // Listen to state changes
     _audioManager.stateStream.listen((state) {
       if (!mounted) return;
@@ -28,15 +32,15 @@ class _HomePageState extends State<HomePage> {
             _statusMessage = "Gestoppt";
             break;
           case AudioState.buffering:
-             _isRunning = true;
+            _isRunning = true;
             _statusMessage = "Pufferung...";
             break;
           case AudioState.playing:
-             _isRunning = true;
+            _isRunning = true;
             _statusMessage = "Gibt Audio wieder";
             break;
           case AudioState.error:
-             _isRunning = false;
+            _isRunning = false;
             _statusMessage = "Ein Fehler ist aufgetreten";
             break;
         }
@@ -48,7 +52,7 @@ class _HomePageState extends State<HomePage> {
       print("AudioLog: $log");
       // Optional: Update status with log if it's not just a state change
       if (_audioManager.currentState == AudioState.error) {
-         if (mounted) setState(() => _statusMessage = log);
+        if (mounted) setState(() => _statusMessage = log);
       }
     });
   }
@@ -85,7 +89,10 @@ class _HomePageState extends State<HomePage> {
             children: [
               Text(
                 _statusMessage,
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 20),
@@ -102,8 +109,13 @@ class _HomePageState extends State<HomePage> {
               ElevatedButton(
                 onPressed: _toggleStart,
                 style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
-                  backgroundColor: _isRunning ? Colors.red : Theme.of(context).primaryColor,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 40,
+                    vertical: 15,
+                  ),
+                  backgroundColor: _isRunning
+                      ? Colors.red
+                      : Theme.of(context).primaryColor,
                   foregroundColor: Colors.white,
                 ),
                 child: Text(
@@ -112,8 +124,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
               const SizedBox(height: 10),
-              if (_isRunning)
-                const CircularProgressIndicator()
+              if (_isRunning) const CircularProgressIndicator(),
             ],
           ),
         ),

@@ -19,11 +19,12 @@ class AudioPlayerEngine {
     _audioStream ??= getAudioStream();
 
     try {
-      await _audioStream!.init(
-        bufferMilliSec:        100,  // 100 ms ring-buffer
-        waitingBufferMilliSec: 20,   // start playback after 20 ms of buffered audio
-        channels:              channels,
-        sampleRate:            sampleRate,
+      _audioStream!.init(
+        bufferMilliSec: 100, // 100 ms ring-buffer
+        waitingBufferMilliSec:
+            20, // start playback after 20 ms of buffered audio
+        channels: channels,
+        sampleRate: sampleRate,
       );
       print('[Player] Initialised: sr=$sampleRate  ch=$channels');
     } catch (e) {
