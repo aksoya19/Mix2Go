@@ -1,21 +1,22 @@
 import 'dart:typed_data';
 import 'package:udp/udp.dart';
 
-// JUCE Mix2Go protocol — header layout (26 bytes, all little-endian):
+// JUCE Mix2Go protocol — header layout (28 bytes, all little-endian):
 //
 //   Offset  Size  Type     Field
 //   ------  ----  -------  -----
 //    0       4    uint32   magic         = 0x4D324730 ("M2G0")
 //    4       4    uint32   sampleRate
 //    8       2    uint16   numChannels
-//   10       4    uint32   numSamples
-//   14       8    uint64   timestamp     (µs since stream start — ignored)
-//   22       4    uint32   sequenceNumber
-//   26       ?    float32  audio data    (interleaved L R L R … in [-1.0, 1.0])
+//   10       2    uint16   flags         (reserved, always 0 — ignored)
+//   12       4    uint32   numSamples
+//   16       8    uint64   timestamp     (µs since stream start — ignored)
+//   24       4    uint32   sequenceNumber
+//   28       ?    int16    audio data    (interleaved L R L R … PCM16 LE)
 //
-// Audio payload size = numSamples * numChannels * 4 bytes.
+// Audio payload size = numSamples * numChannels * 2 bytes.
 
-const int _kHeaderSize = 26;
+const int _kHeaderSize = 28;
 const int _kMagic = 0x4D324730;
 
 class JucePacket {
@@ -68,9 +69,10 @@ class UdpReceiver {
           final magic          = bd.getUint32(0,  Endian.little);
           final sampleRate     = bd.getUint32(4,  Endian.little);
           final numChannels    = bd.getUint16(8,  Endian.little);
-          final numSamples     = bd.getUint32(10, Endian.little);
-          // timestamp at offset 14 (uint64) — read but not used for playback
-          final sequenceNumber = bd.getUint32(22, Endian.little);
+          // flags at offset 10 (uint16) — reserved, ignored
+          final numSamples     = bd.getUint32(12, Endian.little);
+          // timestamp at offset 16 (uint64) — ignored
+          final sequenceNumber = bd.getUint32(24, Endian.little);
 
           // ── Magic check ─────────────────────────────────────────────────
           if (magic != _kMagic) {
@@ -79,7 +81,7 @@ class UdpReceiver {
           }
 
           // ── Payload size check ──────────────────────────────────────────
-          final expectedBytes = numSamples * numChannels * 4; // 4 bytes per float32
+          final expectedBytes = numSamples * numChannels * 2; // 2 bytes per int16
           if (raw.length < _kHeaderSize + expectedBytes) {
             print('[UDP] Payload too short: '
                 'got ${raw.length - _kHeaderSize}, expected $expectedBytes bytes');
@@ -93,16 +95,13 @@ class UdpReceiver {
                 'pkt=${raw.length} bytes');
           }
 
-          // ── Extract float32 payload ─────────────────────────────────────
-          //
-          // IMPORTANT: Float32List.sublistView requires the byte offset to be
-          // a multiple of 4 (Float32 alignment). The header is 26 bytes and
-          // 26 % 4 == 2, so we CANNOT view in-place. We copy the payload into
-          // a fresh 4-byte-aligned Uint8List first.
-          //
-          final alignedPayload = Uint8List(expectedBytes);
-          alignedPayload.setRange(0, expectedBytes, raw, _kHeaderSize);
-          final Float32List float32samples = Float32List.sublistView(alignedPayload);
+          // ── Convert PCM16 payload to float32 ───────────────────────────
+          final int sampleCount = numSamples * numChannels;
+          final Float32List float32samples = Float32List(sampleCount);
+          final ByteData payload = ByteData.sublistView(raw, _kHeaderSize, _kHeaderSize + expectedBytes);
+          for (int i = 0; i < sampleCount; i++) {
+            float32samples[i] = payload.getInt16(i * 2, Endian.little) / 32767.0;
+          }
 
           onPacket(JucePacket(
             sampleRate: sampleRate,

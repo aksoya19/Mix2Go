@@ -7,10 +7,15 @@ enum AudioState { stopped, buffering, playing, error }
 
 /// Orchestrates UDP reception → jitter buffer → audio playback.
 ///
-/// The network receive path only enqueues packets into the [JitterBuffer].
-/// A [Timer.periodic] pulls one frame per tick and feeds it to the player,
-/// inserting silence for any missing sequence numbers.
+/// Playback is driven by the packet arrival rate, not by a timer.
+/// Each incoming packet triggers a drain of the jitter buffer up to
+/// (latestSeq - _kWindowAhead), so [mp_audio_stream]'s ring buffer is
+/// filled at exactly the network rate with no platform timer dependency.
 class AudioManager {
+  // Jitter window: how many packets behind the receive frontier we consume.
+  // Packets arriving up to this many slots late are still served in order.
+  static const int _kWindowAhead = 3;
+
   final AudioPlayerEngine _player = AudioPlayerEngine();
   final UdpReceiver _receiver = UdpReceiver();
   final JitterBuffer _jitterBuffer = JitterBuffer();
@@ -29,8 +34,7 @@ class AudioManager {
 
   bool _playerStarted = false;
   bool _playerStarting = false;
-
-  Timer? _playbackTimer;
+  int? _latestSeq;
   int _consecutiveSilence = 0;
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -40,6 +44,7 @@ class AudioManager {
 
     _playerStarted = false;
     _playerStarting = false;
+    _latestSeq = null;
     _jitterBuffer.reset();
 
     _updateState(AudioState.buffering);
@@ -55,13 +60,12 @@ class AudioManager {
   }
 
   Future<void> stop() async {
-    _playbackTimer?.cancel();
-    _playbackTimer = null;
     _jitterBuffer.reset();
     _receiver.stop();
     await _player.stopStream();
     _playerStarted = false;
     _playerStarting = false;
+    _latestSeq = null;
     _consecutiveSilence = 0;
     _updateState(AudioState.stopped);
     _log('Stopped.');
@@ -75,69 +79,73 @@ class AudioManager {
     _logController.close();
   }
 
-  // ── Packet handler (network thread) ──────────────────────────────────────
+  // ── Packet handler ────────────────────────────────────────────────────────
 
   void _handlePacket(JucePacket packet) {
     if (_isDisposed) return;
 
+    _latestSeq = packet.sequenceNumber;
     _jitterBuffer.add(packet);
 
-    // Start the player once the pre-buffer has enough packets to absorb jitter.
+    // Start the player once the pre-buffer is filled.
     if (!_playerStarted && !_playerStarting && _jitterBuffer.isReady) {
       _playerStarting = true;
-      _initPlayer(packet.sampleRate, packet.numChannels, packet.numSamples);
+      _initPlayer(packet.sampleRate, packet.numChannels);
+      return;
+    }
+
+    if (_playerStarted) {
+      _drainUpTo(packet.sequenceNumber - _kWindowAhead);
     }
   }
 
-  // ── Playback timer ────────────────────────────────────────────────────────
+  // ── Arrival-driven drain ──────────────────────────────────────────────────
 
-  void _onPlaybackTick(Timer _) {
-    if (!_playerStarted) return;
+  /// Feed all buffered frames whose sequence number is ≤ [maxSeq] to the
+  /// audio player.  Gaps in the sequence are filled with silence.
+  void _drainUpTo(int maxSeq) {
+    while (true) {
+      final next = _jitterBuffer.nextExpectedSeq;
+      if (next == null || next > maxSeq) break;
 
-    final result = _jitterBuffer.consume();
-    if (result == null) return;
+      final result = _jitterBuffer.consume();
+      if (result == null) break;
 
-    final (samples, wasSilent) = result;
-    _player.feedFloat32(samples);
+      final (samples, wasSilent) = result;
+      _player.feedFloat32(samples);
 
-    if (wasSilent) {
-      _consecutiveSilence++;
-      if (_consecutiveSilence == 1 || _consecutiveSilence % 50 == 0) {
-        _log(
-          'Packet loss — loss rate: '
-          '${(_jitterBuffer.lossRate * 100).toStringAsFixed(1)}%  '
-          'buffered: ${_jitterBuffer.buffered}',
-        );
+      if (wasSilent) {
+        _consecutiveSilence++;
+        if (_consecutiveSilence == 1 || _consecutiveSilence % 50 == 0) {
+          _log(
+            'Packet loss — loss rate: '
+            '${(_jitterBuffer.lossRate * 100).toStringAsFixed(1)}%  '
+            'buffered: ${_jitterBuffer.buffered}',
+          );
+        }
+      } else {
+        _consecutiveSilence = 0;
       }
-    } else {
-      _consecutiveSilence = 0;
     }
   }
 
   // ── Player initialisation ─────────────────────────────────────────────────
 
-  Future<void> _initPlayer(int sampleRate, int channels, int numSamples) async {
+  Future<void> _initPlayer(int sampleRate, int channels) async {
     try {
       await _player.startStream(sampleRate: sampleRate, channels: channels);
+
+      // Discard any backlog that piled up during async init so that
+      // _nextSeq aligns with the live receive position.
+      if (_latestSeq != null) {
+        _jitterBuffer.syncToSeq(_latestSeq! - _kWindowAhead);
+      }
+
       _playerStarted = true;
-
-      // Derive the packet duration from the stream parameters and start the
-      // output timer. Clamped to [1, 100] ms to guard against bad header values.
-      final intervalMs =
-          (numSamples * 1000 / sampleRate).round().clamp(1, 100);
-      _playbackTimer = Timer.periodic(
-        Duration(milliseconds: intervalMs),
-        _onPlaybackTick,
-      );
-
       _log(
         'Jitter buffer ready — sr=$sampleRate  ch=$channels  '
-        'interval=${intervalMs}ms  '
-        'pre-buffer=${JitterBuffer.kPreBufferPackets} packets',
+        'window=$_kWindowAhead packets',
       );
-      print('[AudioManager] Player started: sr=$sampleRate  ch=$channels  '
-          'timer=${intervalMs}ms');
-
       _updateState(AudioState.playing);
     } catch (e) {
       _log('Player init failed: $e');

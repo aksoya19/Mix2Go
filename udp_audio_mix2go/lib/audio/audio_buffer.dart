@@ -42,6 +42,9 @@ class JitterBuffer {
   /// True once [kPreBufferPackets] have been received.
   bool get isReady => _ready;
 
+  /// The next sequence number that [consume] will look for.
+  int? get nextExpectedSeq => _nextSeq;
+
   /// Packets currently held in the buffer.
   int get buffered => _map.length;
 
@@ -65,6 +68,15 @@ class JitterBuffer {
     // Sequence gap — substitute a silent frame of the correct size.
     _lostPackets++;
     return (Float32List(_numSamples * _numChannels), true);
+  }
+
+  /// Advance [nextExpectedSeq] to [seq] and evict all older packets.
+  ///
+  /// Called after async player init to discard the backlog that accumulated
+  /// while the audio engine was starting up.
+  void syncToSeq(int seq) {
+    _map.removeWhere((k, _) => k < seq);
+    if (_nextSeq == null || _nextSeq! < seq) _nextSeq = seq;
   }
 
   /// Reset all state (call when stopping).
