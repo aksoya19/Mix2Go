@@ -9,10 +9,12 @@ import '../network/udp_receiver.dart';
 /// downstream audio stream never starves.
 class JitterBuffer {
   /// Packets to accumulate before allowing [consume] to return data.
-  static const int kPreBufferPackets = 5;
+  /// 30 packets × 5 ms = 150 ms of pre-roll before playback starts.
+  static const int kPreBufferPackets = 30;
 
   /// Hard cap on buffered packets — oldest is evicted on overflow.
-  static const int kMaxPackets = 60;
+  /// 150 packets × 5 ms = 750 ms of buffer headroom.
+  static const int kMaxPackets = 150;
 
   final SplayTreeMap<int, JucePacket> _map = SplayTreeMap();
 
@@ -47,6 +49,10 @@ class JitterBuffer {
 
   /// Packets currently held in the buffer.
   int get buffered => _map.length;
+
+  /// Size of a silence frame matching the current stream parameters.
+  /// Used by the drain timer to keep the ring buffer fed during underruns.
+  int get silenceFrameSize => _numSamples * _numChannels;
 
   /// Fraction of consumed slots filled with silence (0.0–1.0).
   double get lossRate =>
