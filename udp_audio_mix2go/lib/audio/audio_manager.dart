@@ -18,7 +18,7 @@ enum AudioState { stopped, buffering, playing, error }
 class AudioManager {
   // Jitter window: consume sequence number N only after packet N+kWindowAhead
   // has arrived, giving that many packets of reorder tolerance.
-  static const int _kWindowAhead = 3;
+  static const int _kWindowAhead = 6;
 
   final AudioPlayerEngine _player = AudioPlayerEngine();
   final UdpReceiver _receiver = UdpReceiver();
