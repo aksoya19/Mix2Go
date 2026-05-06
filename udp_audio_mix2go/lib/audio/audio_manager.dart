@@ -153,13 +153,7 @@ class AudioManager {
         nextSeq != null &&
         nextSeq <= latest - _kWindowAhead;
 
-    // Buffer-level guard: if the buffer is too shallow, pause consumption so
-    // incoming packets can replenish it before we advance nextSeq further.
-    // This prevents a downward spiral where low buffer → more underruns →
-    // silence inserted → buffer never recovers.
-    final bufferHealthy = _jitterBuffer.buffered >= _kWindowAhead + 2;
-
-    if (windowOpen && bufferHealthy) {
+    if (windowOpen) {
       final result = _jitterBuffer.consume(); // never null when window is open
       if (result != null) {
         final (samples, wasSilent) = result;
@@ -204,7 +198,6 @@ class AudioManager {
     if (_underruns == 1 || _underruns % 50 == 0) {
       _log(
         'Underrun #$_underruns — window: $windowOpen  '
-        'bufHealthy: $bufferHealthy  '
         'buf: ${_jitterBuffer.buffered}  '
         'nextSeq: $nextSeq  latest: $latest',
       );
