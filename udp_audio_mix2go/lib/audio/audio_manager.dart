@@ -18,7 +18,8 @@ enum AudioState { stopped, buffering, playing, error }
 class AudioManager {
   // Jitter window: consume sequence number N only after packet N+kWindowAhead
   // has arrived, giving that many packets of reorder tolerance.
-  static const int _kWindowAhead = 6;
+  static const int _kWindowAhead = 10;
+  static const int _kTargetBuffer = 20;
 
   final AudioPlayerEngine _player = AudioPlayerEngine();
   final UdpReceiver _receiver = UdpReceiver();
@@ -44,8 +45,9 @@ class AudioManager {
   Timer? _drainTimer;
 
   // Diagnostic counters reset on each start.
-  int _underruns = 0;   // ticks where the window was not open (no real frame fed)
-  int _tickCount = 0;   // total drain-timer ticks since playback began
+  int _underruns = 0;      // ticks where the window was not open (no real frame fed)
+  int _tickCount = 0;      // total drain-timer ticks since playback began
+  int _driftCheckTick = 0; // counter for periodic drift correction
 
   // ── Public API ────────────────────────────────────────────────────────────
 
@@ -57,6 +59,7 @@ class AudioManager {
     _latestSeq = null;
     _underruns = 0;
     _tickCount = 0;
+    _driftCheckTick = 0;
     _consecutiveSilence = 0;
     _jitterBuffer.reset();
 
@@ -117,6 +120,29 @@ class AudioManager {
     if (!_playerStarted) return;
     _tickCount++;
 
+    // Drift correction: every 100 ticks (~0.5 s) check the buffer level and
+    // nudge consumption to keep it near _kTargetBuffer.
+    _driftCheckTick++;
+    if (_driftCheckTick >= 100) {
+      _driftCheckTick = 0;
+      final level = _jitterBuffer.buffered;
+      if (level > _kTargetBuffer + 15) {
+        // Buffer filling faster than drain → consume one extra packet now.
+        final extra = _jitterBuffer.consume();
+        if (extra != null) _player.feedFloat32(extra.$1);
+      } else if (level < _kTargetBuffer ~/ 2 && level > 0) {
+        // Buffer draining faster than fill → skip this tick to let it recover.
+        _underruns++;
+        final plcFrame = _jitterBuffer.lastValidFrame;
+        _player.feedFloat32(
+          plcFrame != null
+              ? Float32List.fromList(plcFrame)
+              : Float32List(_jitterBuffer.silenceFrameSize),
+        );
+        return;
+      }
+    }
+
     final latest = _latestSeq;
     final nextSeq = _jitterBuffer.nextExpectedSeq;
 
@@ -127,7 +153,13 @@ class AudioManager {
         nextSeq != null &&
         nextSeq <= latest - _kWindowAhead;
 
-    if (windowOpen) {
+    // Buffer-level guard: if the buffer is too shallow, pause consumption so
+    // incoming packets can replenish it before we advance nextSeq further.
+    // This prevents a downward spiral where low buffer → more underruns →
+    // silence inserted → buffer never recovers.
+    final bufferHealthy = _jitterBuffer.buffered >= _kWindowAhead + 2;
+
+    if (windowOpen && bufferHealthy) {
       final result = _jitterBuffer.consume(); // never null when window is open
       if (result != null) {
         final (samples, wasSilent) = result;
@@ -157,16 +189,22 @@ class AudioManager {
       }
     }
 
-    // Window not yet open (e.g. jitter stall) or buffer genuinely empty.
-    // Feed silence so the ring buffer does not starve.
+    // Window closed or buffer too shallow — feed PLC frame WITHOUT calling
+    // consume(), so nextSeq does not advance and the buffer can recover.
     _underruns++;
+    final plcFrame = _jitterBuffer.lastValidFrame;
     final frameSize = _jitterBuffer.silenceFrameSize;
     if (frameSize > 0) {
-      _player.feedFloat32(Float32List(frameSize));
+      _player.feedFloat32(
+        plcFrame != null
+            ? Float32List.fromList(plcFrame)
+            : Float32List(frameSize),
+      );
     }
     if (_underruns == 1 || _underruns % 50 == 0) {
       _log(
-        'Underrun #$_underruns — window open: $windowOpen  '
+        'Underrun #$_underruns — window: $windowOpen  '
+        'bufHealthy: $bufferHealthy  '
         'buf: ${_jitterBuffer.buffered}  '
         'nextSeq: $nextSeq  latest: $latest',
       );
@@ -187,17 +225,18 @@ class AudioManager {
 
       _playerStarted = true;
 
-      // Tick at the sender's packet rate so consumption matches production.
-      final intervalMs =
-          (numSamples * 1000 / sampleRate).round().clamp(1, 100);
+      // Tick at the sender's packet rate using microsecond precision to avoid
+      // the ~1 ms rounding error that causes long-term buffer drain at 5 ms/pkt.
+      final intervalUs =
+          (numSamples * 1000000 ~/ sampleRate).clamp(1000, 100000);
       _drainTimer = Timer.periodic(
-        Duration(milliseconds: intervalMs),
+        Duration(microseconds: intervalUs),
         _onDrainTick,
       );
 
       _log(
         'Playback started — sr=$sampleRate  ch=$channels  '
-        'tick=${intervalMs}ms  window=$_kWindowAhead pkts  '
+        'tick=$intervalUs µs  window=$_kWindowAhead pkts  '
         'pre-buffer=${JitterBuffer.kPreBufferPackets} pkts',
       );
       _updateState(AudioState.playing);

@@ -9,8 +9,8 @@ import '../network/udp_receiver.dart';
 /// downstream audio stream never starves.
 class JitterBuffer {
   /// Packets to accumulate before allowing [consume] to return data.
-  /// 50 packets × 5 ms = 250 ms of pre-roll before playback starts.
-  static const int kPreBufferPackets = 50;
+  /// 80 packets × 5 ms = 400 ms of pre-roll before playback starts.
+  static const int kPreBufferPackets = 80;
 
   /// Hard cap on buffered packets — oldest is evicted on overflow.
   /// 150 packets × 5 ms = 750 ms of buffer headroom.
@@ -22,6 +22,7 @@ class JitterBuffer {
   int _lostPackets = 0;
   int _totalConsumed = 0;
   bool _ready = false;
+  Float32List? _lastValidFrame;
 
   // Cached from the last received packet — used to size silence frames.
   int _numSamples = 512;
@@ -54,6 +55,9 @@ class JitterBuffer {
   /// Used by the drain timer to keep the ring buffer fed during underruns.
   int get silenceFrameSize => _numSamples * _numChannels;
 
+  /// Last successfully decoded audio frame, used for packet-loss concealment.
+  Float32List? get lastValidFrame => _lastValidFrame;
+
   /// Fraction of consumed slots filled with silence (0.0–1.0).
   double get lossRate =>
       _totalConsumed == 0 ? 0.0 : _lostPackets / _totalConsumed;
@@ -69,11 +73,15 @@ class JitterBuffer {
     _nextSeq = seq + 1;
 
     final packet = _map.remove(seq);
-    if (packet != null) return (packet.samples, false);
+    if (packet != null) {
+      _lastValidFrame = packet.samples;
+      return (packet.samples, false);
+    }
 
-    // Sequence gap — substitute a silent frame of the correct size.
+    // Sequence gap — repeat last valid frame (PLC) to avoid abrupt silence.
     _lostPackets++;
-    return (Float32List(_numSamples * _numChannels), true);
+    final plc = _lastValidFrame ?? Float32List(_numSamples * _numChannels);
+    return (Float32List.fromList(plc), true);
   }
 
   /// Advance [nextExpectedSeq] to [seq] and evict all older packets.
@@ -92,5 +100,6 @@ class JitterBuffer {
     _lostPackets = 0;
     _totalConsumed = 0;
     _ready = false;
+    _lastValidFrame = null;
   }
 }
