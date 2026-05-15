@@ -9,8 +9,8 @@ import '../network/udp_receiver.dart';
 /// downstream audio stream never starves.
 class JitterBuffer {
   /// Packets to accumulate before allowing [consume] to return data.
-  /// 80 packets × 5 ms = 400 ms of pre-roll before playback starts.
-  static const int kPreBufferPackets = 80;
+  /// 25 packets × 5 ms = 125 ms of pre-roll before playback starts.
+  static const int kPreBufferPackets = 25;
 
   /// Hard cap on buffered packets — oldest is evicted on overflow.
   /// 150 packets × 5 ms = 750 ms of buffer headroom.
@@ -78,10 +78,15 @@ class JitterBuffer {
       return (packet.samples, false);
     }
 
-    // Sequence gap — repeat last valid frame (PLC) to avoid abrupt silence.
+    // Sequence gap — fade out last valid frame to avoid metallic repeat artifacts.
     _lostPackets++;
-    final plc = _lastValidFrame ?? Float32List(_numSamples * _numChannels);
-    return (Float32List.fromList(plc), true);
+    final plc = _lastValidFrame;
+    if (plc == null) return (Float32List(_numSamples * _numChannels), true);
+    final faded = Float32List(plc.length);
+    for (int i = 0; i < plc.length; i++) {
+      faded[i] = plc[i] * (1.0 - i / plc.length);
+    }
+    return (faded, true);
   }
 
   /// Advance [nextExpectedSeq] to [seq] and evict all older packets.

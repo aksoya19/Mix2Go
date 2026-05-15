@@ -16,10 +16,14 @@ enum AudioState { stopped, buffering, playing, error }
 /// Tailscale/WireGuard burst (N packets delivered simultaneously) is spread
 /// over N ticks instead of being flushed into mp_audio_stream all at once.
 class AudioManager {
-  // Jitter window: consume sequence number N only after packet N+kWindowAhead
-  // has arrived, giving that many packets of reorder tolerance.
-  static const int _kWindowAhead = 10;
-  static const int _kTargetBuffer = 20;
+  // Jitter window: consume sequence number N only after packet N+_kWindowAhead
+  // has arrived, giving that many packets of reorder tolerance (5 pkts = 25ms).
+  static const int _kWindowAhead = 5;
+  // How many extra packets to keep above the window after sync.
+  // Buffer after sync = _kWindowAhead + _kSyncMargin + 1 ≈ 21 packets.
+  static const int _kSyncMargin = 15;
+  // Target buffer for drift correction.
+  static const int _kTargetBuffer = 15;
 
   final AudioPlayerEngine _player = AudioPlayerEngine();
   final UdpReceiver _receiver = UdpReceiver();
@@ -126,12 +130,13 @@ class AudioManager {
     if (_driftCheckTick >= 100) {
       _driftCheckTick = 0;
       final level = _jitterBuffer.buffered;
-      if (level > _kTargetBuffer + 15) {
-        // Buffer filling faster than drain → consume one extra packet now.
+      if (level > _kTargetBuffer + 10) {
+        // Buffer overfilling → consume one extra packet to drain toward target.
         final extra = _jitterBuffer.consume();
         if (extra != null) _player.feedFloat32(extra.$1);
-      } else if (level < _kTargetBuffer ~/ 2 && level > 0) {
-        // Buffer draining faster than fill → skip this tick to let it recover.
+      } else if (level < _kWindowAhead && level > 0) {
+        // Buffer dangerously low → skip one consumption tick so incoming
+        // packets can replenish before we advance nextSeq further.
         _underruns++;
         final plcFrame = _jitterBuffer.lastValidFrame;
         _player.feedFloat32(
@@ -210,10 +215,11 @@ class AudioManager {
     try {
       await _player.startStream(sampleRate: sampleRate, channels: channels);
 
-      // Discard the startup backlog — align _nextSeq to the live position so
-      // the first timer tick is close to the current receive frontier.
+      // Sync nextSeq to keep _kWindowAhead + _kSyncMargin packets of headroom.
+      // Previously this left only _kWindowAhead+1 packets → window was always
+      // at its boundary → ~50% of ticks triggered PLC → constant noise layer.
       if (_latestSeq != null) {
-        _jitterBuffer.syncToSeq(_latestSeq! - _kWindowAhead);
+        _jitterBuffer.syncToSeq(_latestSeq! - _kWindowAhead - _kSyncMargin);
       }
 
       _playerStarted = true;
