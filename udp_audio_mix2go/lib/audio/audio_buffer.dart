@@ -9,8 +9,10 @@ import '../network/udp_receiver.dart';
 /// downstream audio stream never starves.
 class JitterBuffer {
   /// Packets to accumulate before allowing [consume] to return data.
-  /// 10 packets × 5 ms = 50 ms of pre-roll before playback starts.
-  static const int kPreBufferPackets = 10;
+  /// Must be > _kWindowAhead + _kSyncMargin (3+8=11) so syncToSeq() has
+  /// enough packets to set a meaningful nextSeq after player init.
+  /// 16 packets × 5 ms = 80 ms of pre-roll before playback starts.
+  static const int kPreBufferPackets = 16;
 
   /// Hard cap on buffered packets — oldest is evicted on overflow.
   /// 150 packets × 5 ms = 750 ms of buffer headroom.
