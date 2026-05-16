@@ -122,8 +122,10 @@ class WindowsAudioOutput {
         final hdr = calloc<WAVEHDR>();
         hdr.ref.lpData         = buf;
         hdr.ref.dwBufferLength = _kBytesPerBuf;
-        hdr.ref.dwFlags        = _WHDR_DONE; // mark done so first poll fills them
+        hdr.ref.dwFlags        = 0;
         _waveOutPrepareHeader(_hWaveOut, hdr, sizeOf<WAVEHDR>());
+        // Set WHDR_DONE *after* prepare so the flag survives (prepare sets WHDR_PREPARED).
+        hdr.ref.dwFlags |= _WHDR_DONE;
         _pcmBufs.add(buf);
         _headers.add(hdr);
       }
@@ -141,6 +143,10 @@ class WindowsAudioOutput {
 
   void start() {
     if (!_isOpen) return;
+    // Re-assert WHDR_DONE on all headers in case waveOutPrepareHeader cleared it.
+    for (final hdr in _headers) {
+      hdr.ref.dwFlags |= _WHDR_DONE;
+    }
     _pollTimer?.cancel();
     // Poll every 5ms — fills any WHDR_DONE buffers from the decode pipeline.
     _pollTimer = Timer.periodic(const Duration(milliseconds: 5), (_) => _poll());
