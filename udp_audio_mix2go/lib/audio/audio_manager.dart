@@ -1,259 +1,280 @@
 import 'dart:async';
+import 'dart:collection';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:opus_dart/opus_dart.dart';
 import '../network/udp_receiver.dart';
-import 'audio_player.dart';
 import 'audio_buffer.dart';
 
 enum AudioState { stopped, buffering, playing, error }
 
-/// Orchestrates UDP reception → jitter buffer → audio playback.
+/// Orchestrates UDP reception → ReorderBuffer → audio output.
 ///
-/// Pipeline:
-///   UDP callback  →  JitterBuffer.add()        (enqueue only, no audio output)
-///   Timer tick    →  consume exactly 1 packet  (feed ring buffer at steady rate)
+/// v2 Pull-model pipeline:
+///   UDP callback  →  ReorderBuffer.add()           (enqueue decoded Opus frame)
+///   onFeedNeeded  →  ReorderBuffer.consume()        (dequeue or Opus FEC)
+///                 →  FlutterPcmSound.feed()         (hardware pull — no timer!)
 ///
-/// Consuming exactly one packet per tick — never more — ensures that a
-/// Tailscale/WireGuard burst (N packets delivered simultaneously) is spread
-/// over N ticks instead of being flushed into mp_audio_stream all at once.
+/// No Timer.periodic — the audio hardware callback drives consumption rate.
+/// This eliminates the timer-drift crackling of the old push model.
 class AudioManager {
-  // Jitter window: consume sequence number N only after packet N+_kWindowAhead
-  // has arrived, giving that many packets of reorder tolerance (3 pkts = 15ms).
-  static const int _kWindowAhead = 3;
-  // How many extra packets to keep above the window after sync.
-  // Buffer after sync = _kWindowAhead + _kSyncMargin + 1 ≈ 12 packets = 60ms.
-  static const int _kSyncMargin = 8;
-  // Target buffer for drift correction.
-  static const int _kTargetBuffer = 8;
+  final UdpReceiver  _receiver = UdpReceiver();
+  final ReorderBuffer _buffer  = ReorderBuffer();
+  SimpleOpusDecoder?  _opusDecoder;
 
-  final AudioPlayerEngine _player = AudioPlayerEngine();
-  final UdpReceiver _receiver = UdpReceiver();
-  final JitterBuffer _jitterBuffer = JitterBuffer();
-
-  final StreamController<AudioState> _stateController =
+  final StreamController<AudioState> _stateCtrl =
       StreamController<AudioState>.broadcast();
-  final StreamController<String> _logController =
+  final StreamController<String> _logCtrl =
       StreamController<String>.broadcast();
 
-  Stream<AudioState> get stateStream => _stateController.stream;
-  Stream<String> get logStream => _logController.stream;
+  Stream<AudioState> get stateStream => _stateCtrl.stream;
+  Stream<String>     get logStream   => _logCtrl.stream;
 
-  bool _isDisposed = false;
+  bool       _isDisposed   = false;
   AudioState _currentState = AudioState.stopped;
   AudioState get currentState => _currentState;
 
-  bool _playerStarted = false;
-  bool _playerStarting = false;
-  int? _latestSeq;
-  int _consecutiveSilence = 0;
+  // Stream parameters (set from first received packet)
+  int _numChannels  = 2;
+  int _numSamples   = 960; // per channel
+  int _sampleRate   = 48000;
 
-  Timer? _drainTimer;
+  // Internal queue bridges Opus frame size (960 samples) and hardware block size
+  // (variable, e.g. 512 or 256). Prevents partial-frame artifacts.
+  final Queue<Int16List> _feedQueue = Queue();
 
-  // Diagnostic counters reset on each start.
-  int _underruns = 0;      // ticks where the window was not open (no real frame fed)
-  int _tickCount = 0;      // total drain-timer ticks since playback began
-  int _driftCheckTick = 0; // counter for periodic drift correction
+  // EOS fade state
+  bool   _fadingOut = false;
+  double _fadeGain  = 1.0;
+  static const double _kFadeStep = 0.1; // 10 frames × 20 ms = 200 ms fade
 
-  // ── Public API ────────────────────────────────────────────────────────────
+  // Stats
+  int _underruns    = 0;
+  int _totalFedMs   = 0;
+  int _bytesReceived = 0;
+  DateTime? _startTime;
+
+  // Exposed to UI
+  int    get buffered      => _buffer.buffered;
+  double get lossRate      => _buffer.lossRate;
+  double get bitrateKbps {
+    if (_startTime == null) return 0;
+    final secs = DateTime.now().difference(_startTime!).inMilliseconds / 1000.0;
+    return secs > 0 ? (_bytesReceived * 8) / (secs * 1000) : 0;
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
 
   Future<void> start(int port) async {
     if (_currentState != AudioState.stopped) return;
 
-    _playerStarted = false;
-    _playerStarting = false;
-    _latestSeq = null;
-    _underruns = 0;
-    _tickCount = 0;
-    _driftCheckTick = 0;
-    _consecutiveSilence = 0;
-    _jitterBuffer.reset();
+    _buffer.reset();
+    _feedQueue.clear();
+    _fadingOut    = false;
+    _fadeGain     = 1.0;
+    _underruns    = 0;
+    _totalFedMs   = 0;
+    _bytesReceived = 0;
+    _startTime    = null;
 
     _updateState(AudioState.buffering);
     _log('Listening on UDP port $port…');
 
     try {
-      await _receiver.start(port: port, onPacket: _handlePacket);
+      await _receiver.start(
+        port: port,
+        onPacket: _handlePacket,
+        onEos:    _handleEos,
+      );
     } catch (e) {
       _log('Error binding port $port: $e');
       _updateState(AudioState.error);
-      await stop();
     }
   }
 
   Future<void> stop() async {
-    _drainTimer?.cancel();
-    _drainTimer = null;
-    _jitterBuffer.reset();
     _receiver.stop();
-    await _player.stopStream();
-    _playerStarted = false;
-    _playerStarting = false;
-    _latestSeq = null;
-    _consecutiveSilence = 0;
+
+    try { await FlutterPcmSound.release(); } catch (_) {}
+
+    _opusDecoder?.destroy();
+    _opusDecoder = null;
+
+    _buffer.reset();
+    _feedQueue.clear();
+    _fadingOut  = false;
+    _fadeGain   = 1.0;
+
     _updateState(AudioState.stopped);
     _log('Stopped.');
   }
 
   void dispose() {
     _isDisposed = true;
-    _drainTimer?.cancel();
-    _drainTimer = null;
     stop();
-    _player.dispose();
-    _stateController.close();
-    _logController.close();
+    _stateCtrl.close();
+    _logCtrl.close();
   }
 
-  // ── Packet handler (UDP callback) ─────────────────────────────────────────
+  // ── Packet / EOS handlers (UDP callback) ───────────────────────────────────
 
-  void _handlePacket(JucePacket packet) {
+  void _handlePacket(Mix2GoPacket packet) {
     if (_isDisposed) return;
 
-    _latestSeq = packet.sequenceNumber;
-    _jitterBuffer.add(packet);
+    _bytesReceived += packet.rawBytes;
+    _startTime ??= DateTime.now();
 
-    // Start the player once the pre-buffer threshold is reached.
-    if (!_playerStarted && !_playerStarting && _jitterBuffer.isReady) {
-      _playerStarting = true;
-      _initPlayer(packet.sampleRate, packet.numChannels, packet.numSamples);
+    _numChannels = packet.numChannels;
+    _numSamples  = packet.numSamples;
+    _sampleRate  = packet.sampleRate;
+
+    _buffer.add(packet.sequenceNumber, packet.samples,
+                packet.numSamples, packet.numChannels);
+
+    if (_currentState == AudioState.buffering && _buffer.isReady) {
+      _initPlayer();
     }
   }
 
-  // ── Timer-driven drain (exactly one packet per tick) ──────────────────────
-
-  void _onDrainTick(Timer _) {
-    if (!_playerStarted) return;
-    _tickCount++;
-
-    // Drift correction: every 50 ticks (~0.25 s) check the buffer level and
-    // nudge consumption to keep it near _kTargetBuffer.
-    _driftCheckTick++;
-    if (_driftCheckTick >= 50) {
-      _driftCheckTick = 0;
-      final level = _jitterBuffer.buffered;
-      if (level > _kTargetBuffer + 10) {
-        // Buffer overfilling → consume one extra packet to drain toward target.
-        final extra = _jitterBuffer.consume();
-        if (extra != null) _player.feedFloat32(extra.$1);
-      } else if (level < _kWindowAhead && level > 0) {
-        // Buffer dangerously low → skip one consumption tick so incoming
-        // packets can replenish before we advance nextSeq further.
-        _underruns++;
-        final plcFrame = _jitterBuffer.lastValidFrame;
-        _player.feedFloat32(
-          plcFrame != null
-              ? Float32List.fromList(plcFrame)
-              : Float32List(_jitterBuffer.silenceFrameSize),
-        );
-        return;
-      }
-    }
-
-    final latest = _latestSeq;
-    final nextSeq = _jitterBuffer.nextExpectedSeq;
-
-    // Only consume when the jitter window is open: we need to have seen a
-    // packet at least _kWindowAhead ahead of nextSeq before committing to it
-    // (or calling it lost).  This gives reordered packets time to arrive.
-    final windowOpen = latest != null &&
-        nextSeq != null &&
-        nextSeq <= latest - _kWindowAhead;
-
-    if (windowOpen) {
-      final result = _jitterBuffer.consume(); // never null when window is open
-      if (result != null) {
-        final (samples, wasSilent) = result;
-        _player.feedFloat32(samples);
-
-        if (wasSilent) {
-          _consecutiveSilence++;
-          if (_consecutiveSilence == 1 || _consecutiveSilence % 50 == 0) {
-            _log(
-              'Gap — loss: ${(_jitterBuffer.lossRate * 100).toStringAsFixed(1)}%  '
-              'buf: ${_jitterBuffer.buffered} pkts',
-            );
-          }
-        } else {
-          _consecutiveSilence = 0;
-        }
-
-        // Periodic buffer-level log (every ~1 s at 5 ms/tick = 200 ticks).
-        if (_tickCount % 200 == 0) {
-          _log(
-            'buf: ${_jitterBuffer.buffered} pkts  '
-            'loss: ${(_jitterBuffer.lossRate * 100).toStringAsFixed(1)}%  '
-            'underruns: $_underruns',
-          );
-        }
-        return;
-      }
-    }
-
-    // Window closed or buffer too shallow — feed PLC frame WITHOUT calling
-    // consume(), so nextSeq does not advance and the buffer can recover.
-    _underruns++;
-    final plcFrame = _jitterBuffer.lastValidFrame;
-    final frameSize = _jitterBuffer.silenceFrameSize;
-    if (frameSize > 0) {
-      _player.feedFloat32(
-        plcFrame != null
-            ? Float32List.fromList(plcFrame)
-            : Float32List(frameSize),
-      );
-    }
-    if (_underruns == 1 || _underruns % 50 == 0) {
-      _log(
-        'Underrun #$_underruns — window: $windowOpen  '
-        'buf: ${_jitterBuffer.buffered}  '
-        'nextSeq: $nextSeq  latest: $latest',
-      );
+  void _handleEos(int seq) {
+    if (_isDisposed) return;
+    _buffer.markEos();
+    if (_buffer.isEosConfirmed && !_fadingOut) {
+      _fadingOut = true;
+      _log('EOS received — fading out…');
     }
   }
 
-  // ── Player initialisation ─────────────────────────────────────────────────
+  // ── Player initialisation ──────────────────────────────────────────────────
 
-  Future<void> _initPlayer(int sampleRate, int channels, int numSamples) async {
+  Future<void> _initPlayer() async {
     try {
-      await _player.startStream(sampleRate: sampleRate, channels: channels);
-
-      // Sync nextSeq to keep _kWindowAhead + _kSyncMargin packets of headroom.
-      // Keeps the window safely open from the first drain tick (no window-boundary PLC).
-      if (_latestSeq != null) {
-        _jitterBuffer.syncToSeq(_latestSeq! - _kWindowAhead - _kSyncMargin);
-      }
-
-      _playerStarted = true;
-
-      // Tick at the sender's packet rate using microsecond precision to avoid
-      // the ~1 ms rounding error that causes long-term buffer drain at 5 ms/pkt.
-      final intervalUs =
-          (numSamples * 1000000 ~/ sampleRate).clamp(1000, 100000);
-      _drainTimer = Timer.periodic(
-        Duration(microseconds: intervalUs),
-        _onDrainTick,
+      _opusDecoder = SimpleOpusDecoder(
+        sampleRate: _sampleRate,
+        channels:   _numChannels,
       );
 
-      _log(
-        'Playback started — sr=$sampleRate  ch=$channels  '
-        'tick=$intervalUs µs  window=$_kWindowAhead pkts  '
-        'pre-buffer=${JitterBuffer.kPreBufferPackets} pkts',
+      await FlutterPcmSound.setup(
+        sampleRate:   _sampleRate,
+        channelCount: _numChannels,
       );
+
+      // Feed threshold: callback fires when fewer than one Opus frame remains
+      await FlutterPcmSound.setFeedThreshold(_numSamples * _numChannels);
+      FlutterPcmSound.setFeedCallback(_onFeedNeeded);
+
+      FlutterPcmSound.start();
+
       _updateState(AudioState.playing);
+      _log('Playback started — sr=$_sampleRate  ch=$_numChannels'
+           '  frame=${_numSamples}smpl / 20ms'
+           '  pre-buffer=${ReorderBuffer.kPreBufferPackets} pkts');
     } catch (e) {
       _log('Player init failed: $e');
       _updateState(AudioState.error);
     }
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  // ── Feed callback (audio hardware pull) ────────────────────────────────────
+
+  // Called by flutter_pcm_sound when the hardware buffer drops below threshold.
+  // [remainingSamples] = how many samples remain in the hardware buffer.
+  // We must call FlutterPcmSound.feed() before returning.
+  void _onFeedNeeded(int remainingSamples) {
+    if (_isDisposed) return;
+
+    final needed = _numSamples * _numChannels; // Int16 values per Opus frame
+
+    // Refill internal queue until it holds at least one hardware-block worth
+    while (_feedQueue.fold<int>(0, (s, f) => s + f.length) < needed * 2) {
+      final dequeued = _dequeueNextFrame();
+      if (dequeued == null) break;
+      _feedQueue.add(dequeued);
+    }
+
+    // Drain exactly `needed` Int16 values for the hardware block
+    final out = Int16List(needed);
+    int pos = 0;
+    while (pos < needed && _feedQueue.isNotEmpty) {
+      final chunk = _feedQueue.first;
+      final take  = (needed - pos).clamp(0, chunk.length);
+      out.setRange(pos, pos + take, chunk);
+      _feedQueue.removeFirst();
+      if (take < chunk.length) {
+        _feedQueue.addFirst(Int16List.sublistView(chunk, take));
+      }
+      pos += take;
+    }
+
+    // Apply EOS fade
+    if (_fadingOut) {
+      _applyFade(out);
+      _fadeGain = (_fadeGain - _kFadeStep).clamp(0.0, 1.0);
+      if (_fadeGain <= 0.0) {
+        stop(); // fully silent — stop cleanly
+        return;
+      }
+    }
+
+    FlutterPcmSound.feed(PcmArrayInt16.fromList(out)); // fire-and-forget in sync callback
+
+    _totalFedMs += 20; // each Opus frame = 20 ms
+    if ((_totalFedMs ~/ 1000) > ((_totalFedMs - 20) ~/ 1000)) {
+      _log('buf: ${_buffer.buffered} pkts  '
+           'loss: ${(_buffer.lossRate * 100).toStringAsFixed(1)}%  '
+           'underruns: $_underruns  '
+           'bitrate: ${bitrateKbps.toStringAsFixed(0)} kbps');
+    }
+  }
+
+  // ── Internal helpers ───────────────────────────────────────────────────────
+
+  /// Returns the next decoded frame or null if not yet ready.
+  Int16List? _dequeueNextFrame() {
+    if (!_buffer.isReady) {
+      // Pre-buffering: feed silence to prevent hardware underrun click
+      return Int16List(_numSamples * _numChannels);
+    }
+
+    final (frame, needsFec) = _buffer.consume();
+
+    if (frame != null) return frame;
+
+    if (needsFec) {
+      // Opus FEC: pass null payload → decoder uses redundancy from prior packet.
+      // Produces a naturally attenuating concealment frame — no oscillation.
+      _underruns++;
+      // Only attempt FEC if the decoder has already processed at least one
+      // packet (lastPacketDurationMs != null) — otherwise decode(input:null)
+      // throws a StateError because it cannot estimate the missing duration.
+      final dec = _opusDecoder;
+      if (dec != null && dec.lastPacketDurationMs != null) {
+        try {
+          return dec.decode(input: null);
+        } catch (_) {}
+      }
+      return Int16List(_numSamples * _numChannels);
+    }
+
+    // Pre-buffer not full yet
+    return Int16List(_numSamples * _numChannels);
+  }
+
+  void _applyFade(Int16List buf) {
+    for (int i = 0; i < buf.length; i++) {
+      buf[i] = (buf[i] * _fadeGain).round().clamp(-32768, 32767);
+    }
+  }
 
   void _updateState(AudioState state) {
     if (_currentState == state || _isDisposed) return;
     _currentState = state;
-    if (!_stateController.isClosed) _stateController.add(state);
+    if (!_stateCtrl.isClosed) _stateCtrl.add(state);
   }
 
-  void _log(String message) {
-    debugPrint('[AudioManager] $message');
-    if (!_logController.isClosed) _logController.add(message);
+  void _log(String msg) {
+    debugPrint('[AudioManager] $msg');
+    if (!_logCtrl.isClosed) _logCtrl.add(msg);
   }
 }

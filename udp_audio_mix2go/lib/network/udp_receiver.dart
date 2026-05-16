@@ -1,115 +1,69 @@
 import 'dart:typed_data';
 import 'package:udp/udp.dart';
+import 'package:opus_dart/opus_dart.dart';
 
-// JUCE Mix2Go protocol — header layout (28 bytes, all little-endian):
+// Mix2Go v2 protocol — header layout (28 bytes, all little-endian):
 //
-//   Offset  Size  Type     Field
-//   ------  ----  -------  -----
-//    0       4    uint32   magic         = 0x4D324730 ("M2G0")
-//    4       4    uint32   sampleRate
-//    8       2    uint16   numChannels
-//   10       2    uint16   flags         (reserved, always 0 — ignored)
-//   12       4    uint32   numSamples
-//   16       8    uint64   timestamp     (µs since stream start — ignored)
-//   24       4    uint32   sequenceNumber
-//   28       ?    int16    audio data    (interleaved L R L R … PCM16 LE)
-//
-// Audio payload size = numSamples * numChannels * 2 bytes.
+//   Offset  Size  Type    Field              Notes
+//   ------  ----  ------  -----------------  --------------------------------
+//   0       4     uint32  magic              0x4D324731 ("M2G1")
+//   4       1     uint8   frameType          0=Opus  1=PCM16  2=EOS
+//   5       1     uint8   numChannels        2 = stereo
+//   6       2     uint16  payloadLength      byte count of Opus payload
+//   8       4     uint32  sequenceNumber
+//   12      8     uint64  timestamp          µs since stream start (unused)
+//   20      4     uint32  sampleRate         always 48000 in v2
+//   24      4     uint32  opusFrameSamples   960 = 20 ms at 48 kHz
+//   28      N     bytes   payload            Opus bitstream or empty (EOS)
 
 const int _kHeaderSize = 28;
-const int _kMagic = 0x4D324730;
+const int _kMagicV2    = 0x4D324731; // "M2G1"
 
-class JucePacket {
-  final int sampleRate;
-  final int numChannels;
-  final int numSamples;
-  final int sequenceNumber;
-  final Float32List samples; // interleaved [L, R, L, R, ...]
+enum FrameType { opus, pcm16, eos }
 
-  JucePacket({
+class Mix2GoPacket {
+  final int       sequenceNumber;
+  final FrameType frameType;
+  final Int16List samples;     // Int16 interleaved L R L R (empty for EOS)
+  final int       sampleRate;
+  final int       numChannels;
+  final int       numSamples;  // decoded frame size in samples per channel
+  final int       rawBytes;    // total UDP datagram size for bitrate stats
+
+  const Mix2GoPacket({
+    required this.sequenceNumber,
+    required this.frameType,
+    required this.samples,
     required this.sampleRate,
     required this.numChannels,
     required this.numSamples,
-    required this.sequenceNumber,
-    required this.samples,
+    required this.rawBytes,
   });
 }
 
 class UdpReceiver {
   UDP? _socket;
+  SimpleOpusDecoder? _opusDecoder;
   bool _isRunning = false;
 
   bool get isRunning => _isRunning;
 
-  /// Bind to [port] and call [onPacket] for every valid JUCE audio packet.
   Future<void> start({
     required int port,
-    required void Function(JucePacket packet) onPacket,
+    required void Function(Mix2GoPacket packet) onPacket,
+    void Function(int sequenceNumber)? onEos,
   }) async {
     if (_isRunning) return;
 
     try {
       _socket = await UDP.bind(Endpoint.any(port: Port(port)));
       _isRunning = true;
-      print('[UDP] Receiver started on port $port');
+      print('[UDP] Receiver started on port $port (v2 / Opus)');
 
       _socket!.asStream().listen(
         (datagram) {
           if (datagram == null) return;
-          final raw = datagram.data;
-
-          // ── Minimum size check ──────────────────────────────────────────
-          if (raw.length < _kHeaderSize) {
-            print('[UDP] Packet too short (${raw.length} bytes) — ignored.');
-            return;
-          }
-
-          // ── Parse header (all little-endian) ────────────────────────────
-          final bd = ByteData.sublistView(raw);
-          final magic          = bd.getUint32(0,  Endian.little);
-          final sampleRate     = bd.getUint32(4,  Endian.little);
-          final numChannels    = bd.getUint16(8,  Endian.little);
-          // flags at offset 10 (uint16) — reserved, ignored
-          final numSamples     = bd.getUint32(12, Endian.little);
-          // timestamp at offset 16 (uint64) — ignored
-          final sequenceNumber = bd.getUint32(24, Endian.little);
-
-          // ── Magic check ─────────────────────────────────────────────────
-          if (magic != _kMagic) {
-            print('[UDP] Wrong magic 0x${magic.toRadixString(16).toUpperCase()} — ignored.');
-            return;
-          }
-
-          // ── Payload size check ──────────────────────────────────────────
-          final expectedBytes = numSamples * numChannels * 2; // 2 bytes per int16
-          if (raw.length < _kHeaderSize + expectedBytes) {
-            print('[UDP] Payload too short: '
-                'got ${raw.length - _kHeaderSize}, expected $expectedBytes bytes');
-            return;
-          }
-
-          // ── Log every 100 packets ───────────────────────────────────────
-          if (sequenceNumber % 100 == 0) {
-            print('[UDP] seq=$sequenceNumber  sr=$sampleRate  '
-                'ch=$numChannels  samples=$numSamples  '
-                'pkt=${raw.length} bytes');
-          }
-
-          // ── Convert PCM16 payload to float32 ───────────────────────────
-          final int sampleCount = numSamples * numChannels;
-          final Float32List float32samples = Float32List(sampleCount);
-          final ByteData payload = ByteData.sublistView(raw, _kHeaderSize, _kHeaderSize + expectedBytes);
-          for (int i = 0; i < sampleCount; i++) {
-            float32samples[i] = payload.getInt16(i * 2, Endian.little) / 32767.0;
-          }
-
-          onPacket(JucePacket(
-            sampleRate: sampleRate,
-            numChannels: numChannels,
-            numSamples: numSamples,
-            sequenceNumber: sequenceNumber,
-            samples: float32samples,
-          ));
+          _handleDatagram(datagram.data, onPacket, onEos);
         },
         onError: (e) {
           print('[UDP] Stream error: $e');
@@ -130,7 +84,85 @@ class UdpReceiver {
     if (!_isRunning) return;
     _socket?.close();
     _socket = null;
+    _opusDecoder?.destroy();
+    _opusDecoder = null;
     _isRunning = false;
     print('[UDP] Receiver stopped');
+  }
+
+  void _handleDatagram(
+    Uint8List raw,
+    void Function(Mix2GoPacket) onPacket,
+    void Function(int)? onEos,
+  ) {
+    if (raw.length < _kHeaderSize) return;
+
+    final bd = ByteData.sublistView(raw);
+
+    final magic            = bd.getUint32(0,  Endian.little);
+    final frameTypeByte    = bd.getUint8(4);
+    final numChannels      = bd.getUint8(5);
+    final payloadLength    = bd.getUint16(6,  Endian.little);
+    final sequenceNumber   = bd.getUint32(8,  Endian.little);
+    // timestamp @ 12 (8 bytes) — unused
+    final sampleRate       = bd.getUint32(20, Endian.little);
+    final opusFrameSamples = bd.getUint32(24, Endian.little);
+
+    if (magic != _kMagicV2) return;
+
+    final frameType = FrameType.values.elementAtOrNull(frameTypeByte)
+        ?? FrameType.opus;
+
+    // ── EOS ───────────────────────────────────────────────────────────────────
+    if (frameType == FrameType.eos) {
+      if (sequenceNumber % 50 == 0 || payloadLength == 0) {
+        print('[UDP] EOS received  seq=$sequenceNumber');
+      }
+      onEos?.call(sequenceNumber);
+      return;
+    }
+
+    // ── Opus ──────────────────────────────────────────────────────────────────
+    if (frameType == FrameType.opus) {
+      if (payloadLength == 0 || raw.length < _kHeaderSize + payloadLength) {
+        print('[UDP] Opus packet too short — ignored');
+        return;
+      }
+
+      // Lazily create decoder when we know sampleRate / numChannels
+      _opusDecoder ??= SimpleOpusDecoder(
+        sampleRate: sampleRate,
+        channels: numChannels,
+      );
+
+      final payload = Uint8List.sublistView(raw, _kHeaderSize, _kHeaderSize + payloadLength);
+
+      try {
+        final Int16List decoded = _opusDecoder!.decode(input: payload);
+
+        if (sequenceNumber % 50 == 0) {
+          print('[UDP] seq=$sequenceNumber  sr=$sampleRate  ch=$numChannels'
+              '  frames=$opusFrameSamples  payload=${payloadLength}B'
+              '  total=${raw.length}B');
+        }
+
+        onPacket(Mix2GoPacket(
+          sequenceNumber: sequenceNumber,
+          frameType:      FrameType.opus,
+          samples:        decoded,
+          sampleRate:     sampleRate,
+          numChannels:    numChannels,
+          numSamples:     opusFrameSamples,
+          rawBytes:       raw.length,
+        ));
+      } catch (e) {
+        print('[UDP] Opus decode error seq=$sequenceNumber: $e');
+      }
+
+      return;
+    }
+
+    // Unsupported frame type — silently drop
+    print('[UDP] Unknown frameType=$frameTypeByte — ignored');
   }
 }
