@@ -17,13 +17,13 @@ enum AudioState { stopped, buffering, playing, error }
 /// over N ticks instead of being flushed into mp_audio_stream all at once.
 class AudioManager {
   // Jitter window: consume sequence number N only after packet N+_kWindowAhead
-  // has arrived, giving that many packets of reorder tolerance (5 pkts = 25ms).
-  static const int _kWindowAhead = 5;
+  // has arrived, giving that many packets of reorder tolerance (3 pkts = 15ms).
+  static const int _kWindowAhead = 3;
   // How many extra packets to keep above the window after sync.
-  // Buffer after sync = _kWindowAhead + _kSyncMargin + 1 ≈ 21 packets.
-  static const int _kSyncMargin = 15;
+  // Buffer after sync = _kWindowAhead + _kSyncMargin + 1 ≈ 12 packets = 60ms.
+  static const int _kSyncMargin = 8;
   // Target buffer for drift correction.
-  static const int _kTargetBuffer = 15;
+  static const int _kTargetBuffer = 8;
 
   final AudioPlayerEngine _player = AudioPlayerEngine();
   final UdpReceiver _receiver = UdpReceiver();
@@ -124,10 +124,10 @@ class AudioManager {
     if (!_playerStarted) return;
     _tickCount++;
 
-    // Drift correction: every 100 ticks (~0.5 s) check the buffer level and
+    // Drift correction: every 50 ticks (~0.25 s) check the buffer level and
     // nudge consumption to keep it near _kTargetBuffer.
     _driftCheckTick++;
-    if (_driftCheckTick >= 100) {
+    if (_driftCheckTick >= 50) {
       _driftCheckTick = 0;
       final level = _jitterBuffer.buffered;
       if (level > _kTargetBuffer + 10) {
@@ -216,8 +216,7 @@ class AudioManager {
       await _player.startStream(sampleRate: sampleRate, channels: channels);
 
       // Sync nextSeq to keep _kWindowAhead + _kSyncMargin packets of headroom.
-      // Previously this left only _kWindowAhead+1 packets → window was always
-      // at its boundary → ~50% of ticks triggered PLC → constant noise layer.
+      // Keeps the window safely open from the first drain tick (no window-boundary PLC).
       if (_latestSeq != null) {
         _jitterBuffer.syncToSeq(_latestSeq! - _kWindowAhead - _kSyncMargin);
       }

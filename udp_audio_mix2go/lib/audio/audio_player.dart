@@ -20,8 +20,8 @@ class AudioPlayerEngine {
 
     try {
       _audioStream!.init(
-        bufferMilliSec: 300,          // 300 ms ring-buffer
-        waitingBufferMilliSec: 100,   // start playing after 100 ms is buffered
+        bufferMilliSec: 100,          // 100 ms ring-buffer
+        waitingBufferMilliSec: 20,    // start playing after 20 ms is buffered
         channels: channels,
         sampleRate: sampleRate,
       );
