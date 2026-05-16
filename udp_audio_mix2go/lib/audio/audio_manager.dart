@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:opus_dart/opus_dart.dart';
 import '../network/udp_receiver.dart';
 import 'audio_buffer.dart';
+import 'windows_audio_output.dart';
 
 enum AudioState { stopped, buffering, playing, error }
 
@@ -19,9 +21,10 @@ enum AudioState { stopped, buffering, playing, error }
 /// No Timer.periodic — the audio hardware callback drives consumption rate.
 /// This eliminates the timer-drift crackling of the old push model.
 class AudioManager {
-  final UdpReceiver  _receiver = UdpReceiver();
-  final ReorderBuffer _buffer  = ReorderBuffer();
-  SimpleOpusDecoder?  _opusDecoder;
+  final UdpReceiver    _receiver   = UdpReceiver();
+  final ReorderBuffer  _buffer     = ReorderBuffer();
+  SimpleOpusDecoder?   _opusDecoder;
+  WindowsAudioOutput?  _winAudio;
 
   final StreamController<AudioState> _stateCtrl =
       StreamController<AudioState>.broadcast();
@@ -96,7 +99,12 @@ class AudioManager {
   Future<void> stop() async {
     _receiver.stop();
 
-    try { await FlutterPcmSound.release(); } catch (_) {}
+    if (Platform.isWindows) {
+      try { await _winAudio?.release(); } catch (_) {}
+      _winAudio = null;
+    } else {
+      try { await FlutterPcmSound.release(); } catch (_) {}
+    }
 
     _opusDecoder?.destroy();
     _opusDecoder = null;
@@ -155,21 +163,26 @@ class AudioManager {
         channels:   _numChannels,
       );
 
-      await FlutterPcmSound.setup(
-        sampleRate:   _sampleRate,
-        channelCount: _numChannels,
-      );
-
-      // Feed threshold: callback fires when fewer than one Opus frame remains
-      await FlutterPcmSound.setFeedThreshold(_numSamples * _numChannels);
-      FlutterPcmSound.setFeedCallback(_onFeedNeeded);
-
-      FlutterPcmSound.start();
+      if (Platform.isWindows) {
+        _winAudio = WindowsAudioOutput();
+        await _winAudio!.setup(sampleRate: _sampleRate, channelCount: _numChannels);
+        _winAudio!.setFeedCallback(_onFeedNeeded);
+        _winAudio!.start();
+      } else {
+        await FlutterPcmSound.setup(
+          sampleRate:   _sampleRate,
+          channelCount: _numChannels,
+        );
+        await FlutterPcmSound.setFeedThreshold(_numSamples * _numChannels);
+        FlutterPcmSound.setFeedCallback(_onFeedNeeded);
+        FlutterPcmSound.start();
+      }
 
       _updateState(AudioState.playing);
       _log('Playback started — sr=$_sampleRate  ch=$_numChannels'
            '  frame=${_numSamples}smpl / 20ms'
-           '  pre-buffer=${ReorderBuffer.kPreBufferPackets} pkts');
+           '  pre-buffer=${ReorderBuffer.kPreBufferPackets} pkts'
+           '  backend=${Platform.isWindows ? "waveOut" : "flutter_pcm_sound"}');
     } catch (e) {
       _log('Player init failed: $e');
       _updateState(AudioState.error);
@@ -217,7 +230,11 @@ class AudioManager {
       }
     }
 
-    FlutterPcmSound.feed(PcmArrayInt16.fromList(out)); // fire-and-forget in sync callback
+    if (Platform.isWindows) {
+      _winAudio?.feed(out); // synchronous waveOut write
+    } else {
+      FlutterPcmSound.feed(PcmArrayInt16.fromList(out)); // fire-and-forget
+    }
 
     _totalFedMs += 20; // each Opus frame = 20 ms
     if ((_totalFedMs ~/ 1000) > ((_totalFedMs - 20) ~/ 1000)) {
