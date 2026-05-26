@@ -1,112 +1,135 @@
 import 'dart:collection';
 import 'dart:typed_data';
-import '../network/udp_receiver.dart';
 
-/// Sequence-ordered jitter buffer for [JucePacket]s.
+/// Sequence-ordered jitter buffer for decoded Opus frames (Int16 interleaved PCM).
 ///
-/// Decouples the network receive rate from the audio output rate.
-/// Missing sequence numbers are replaced with silence frames so the
-/// downstream audio stream never starves.
-class JitterBuffer {
-  /// Packets to accumulate before allowing [consume] to return data.
-  /// Must be > _kWindowAhead + _kSyncMargin (3+8=11) so syncToSeq() has
-  /// enough packets to set a meaningful nextSeq after player init.
-  /// 16 packets × 5 ms = 80 ms of pre-roll before playback starts.
-  static const int kPreBufferPackets = 16;
+/// Frames are keyed by their UDP sequence number and consumed in strict order.
+/// A gap in the sequence signals FEC so the caller can request Opus packet-loss
+/// concealment instead of silence.
+///
+/// Thread safety: all methods must be called from the same Dart isolate.
+class ReorderBuffer {
+  /// Packets to accumulate before [consume] is allowed to return real data.
+  /// 2 × 10 ms = 20 ms of pre-roll / jitter absorption.
+  static const int kPreBufferPackets = 2;
 
-  /// Hard cap on buffered packets — oldest is evicted on overflow.
-  /// 150 packets × 5 ms = 750 ms of buffer headroom.
+  /// Hard cap on buffered packets — oldest evicted when exceeded.
+  /// 150 × 10 ms = 1.5 s maximum buffer depth.
   static const int kMaxPackets = 150;
 
-  final SplayTreeMap<int, JucePacket> _map = SplayTreeMap();
+  final SplayTreeMap<int, Int16List> _map = SplayTreeMap();
 
-  int? _nextSeq;
-  int _lostPackets = 0;
-  int _totalConsumed = 0;
-  bool _ready = false;
-  Float32List? _lastValidFrame;
+  int?  _nextSeq;
+  int   _lostPackets   = 0;
+  int   _totalConsumed = 0;
+  bool  _ready         = false;
+  bool  _eosMarked     = false;
+  bool  _eosConfirmed  = false;
 
-  // Cached from the last received packet — used to size silence frames.
-  int _numSamples = 512;
-  int _numChannels = 2;
+  // ── Enqueueing ──────────────────────────────────────────────────────────────
 
-  /// Enqueue a received [packet].
-  void add(JucePacket packet) {
-    _numSamples = packet.numSamples;
-    _numChannels = packet.numChannels;
-
-    if (_map.length >= kMaxPackets) {
-      _map.remove(_map.firstKey()); // evict oldest on overflow
+  /// Enqueue a decoded [samples] frame for [sequenceNumber].
+  ///
+  /// [numSamples] and [numChannels] are informational only (used for stream
+  /// restart detection sizing).
+  void add(int sequenceNumber, Int16List samples,
+           int numSamples, int numChannels) {
+    // Stream restart: seq jumped far behind current read head → hard reset.
+    if (_ready && _nextSeq != null &&
+        sequenceNumber < _nextSeq! - kMaxPackets) {
+      _map.clear();
+      _nextSeq       = sequenceNumber;
+      _lostPackets   = 0;
+      _totalConsumed = 0;
+      _ready         = false;
     }
-    _map[packet.sequenceNumber] = packet;
-    _nextSeq ??= packet.sequenceNumber;
+
+    // Evict oldest packet on overflow; advance read head past it so
+    // consume() never loops through a cascade of stale gaps.
+    if (_map.length >= kMaxPackets) {
+      final evicted = _map.firstKey()!;
+      _map.remove(evicted);
+      if (_nextSeq != null && _nextSeq! <= evicted) {
+        _nextSeq = _map.isEmpty ? evicted + 1 : _map.firstKey();
+      }
+    }
+
+    _map[sequenceNumber] = samples;
+    _nextSeq ??= sequenceNumber;
 
     if (!_ready && _map.length >= kPreBufferPackets) _ready = true;
   }
 
-  /// True once [kPreBufferPackets] have been received.
+  // ── State ───────────────────────────────────────────────────────────────────
+
+  /// True once [kPreBufferPackets] have arrived.
   bool get isReady => _ready;
 
-  /// The next sequence number that [consume] will look for.
-  int? get nextExpectedSeq => _nextSeq;
-
-  /// Packets currently held in the buffer.
+  /// Packets currently held.
   int get buffered => _map.length;
 
-  /// Size of a silence frame matching the current stream parameters.
-  /// Used by the drain timer to keep the ring buffer fed during underruns.
-  int get silenceFrameSize => _numSamples * _numChannels;
-
-  /// Last successfully decoded audio frame, used for packet-loss concealment.
-  Float32List? get lastValidFrame => _lastValidFrame;
-
-  /// Fraction of consumed slots filled with silence (0.0–1.0).
+  /// Fraction of consumed slots that were gaps (packet loss rate, 0.0–1.0).
   double get lossRate =>
       _totalConsumed == 0 ? 0.0 : _lostPackets / _totalConsumed;
 
-  /// Returns the next audio frame and whether it is silence.
-  ///
-  /// Returns `null` until [isReady] becomes true.
-  (Float32List, bool)? consume() {
-    if (!_ready || _nextSeq == null) return null;
-    _totalConsumed++;
+  // ── EOS ─────────────────────────────────────────────────────────────────────
 
+  /// Mark end-of-stream.  Confirmed immediately if the buffer is already empty.
+  void markEos() {
+    _eosMarked = true;
+    if (_map.isEmpty) _eosConfirmed = true;
+  }
+
+  /// True once EOS is marked and the last buffered frame has been consumed.
+  bool get isEosConfirmed => _eosConfirmed;
+
+  // ── Consuming ───────────────────────────────────────────────────────────────
+
+  /// Consume the next frame in sequence order.
+  ///
+  /// Returns `(frame, false)` — real audio; use it.
+  /// Returns `(null,  true)`  — sequence gap; apply Opus FEC.
+  /// Returns `(null,  false)` — pre-buffer not yet full; feed silence.
+  (Int16List?, bool) consume() {
+    if (!_ready || _nextSeq == null) return (null, false);
+
+    _totalConsumed++;
     final seq = _nextSeq!;
     _nextSeq = seq + 1;
 
-    final packet = _map.remove(seq);
-    if (packet != null) {
-      _lastValidFrame = packet.samples;
-      return (packet.samples, false);
+    final frame = _map.remove(seq);
+    if (frame != null) {
+      if (_eosMarked && _map.isEmpty) _eosConfirmed = true;
+      return (frame, false);
     }
 
-    // Sequence gap — fade out last valid frame to avoid metallic repeat artifacts.
     _lostPackets++;
-    final plc = _lastValidFrame;
-    if (plc == null) return (Float32List(_numSamples * _numChannels), true);
-    final faded = Float32List(plc.length);
-    for (int i = 0; i < plc.length; i++) {
-      faded[i] = plc[i] * (1.0 - i / plc.length);
-    }
-    return (faded, true);
+    return (null, true); // gap → request FEC
   }
 
-  /// Advance [nextExpectedSeq] to [seq] and evict all older packets.
+  // ── Latency management ──────────────────────────────────────────────────────
+
+  /// Discard accumulated backlog, keeping only the newest [keepPackets] frames.
   ///
-  /// Called after async player init to discard the backlog that accumulated
-  /// while the audio engine was starting up.
-  void syncToSeq(int seq) {
-    _map.removeWhere((k, _) => k < seq);
-    if (_nextSeq == null || _nextSeq! < seq) _nextSeq = seq;
+  /// Call this before the first [consume] so playback starts at real-time
+  /// rather than replaying the setup-time accumulation.
+  void seekToLatest([int keepPackets = kPreBufferPackets]) {
+    while (_map.length > keepPackets) {
+      _map.remove(_map.firstKey());
+    }
+    if (_map.isNotEmpty) _nextSeq = _map.firstKey();
   }
 
-  /// Reset all state (call when stopping).
+  // ── Reset ───────────────────────────────────────────────────────────────────
+
+  /// Reset all state (call on stream stop).
   void reset() {
     _map.clear();
-    _nextSeq = null;
-    _lostPackets = 0;
+    _nextSeq       = null;
+    _lostPackets   = 0;
     _totalConsumed = 0;
-    _ready = false;
-    _lastValidFrame = null;
+    _ready         = false;
+    _eosMarked     = false;
+    _eosConfirmed  = false;
   }
 }

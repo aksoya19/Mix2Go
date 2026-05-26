@@ -48,6 +48,12 @@ class UdpReceiver {
 
   bool get isRunning => _isRunning;
 
+  /// Shared Opus decoder — exposed so AudioManager can call
+  /// decode(input: null) for FEC concealment on packet gaps.
+  /// FEC REQUIRES the same decoder instance that decoded the last real
+  /// packet; a fresh decoder produces noise/garbage.
+  SimpleOpusDecoder? get opusDecoder => _opusDecoder;
+
   Future<void> start({
     required int port,
     required void Function(Mix2GoPacket packet) onPacket,
