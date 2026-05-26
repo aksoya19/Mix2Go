@@ -4,7 +4,7 @@ import AVFoundation
 import ObjectiveC
 
 @main
-@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+@objc class AppDelegate: FlutterAppDelegate {
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -13,14 +13,12 @@ import ObjectiveC
     // ── iOS 26 beta VSync crash workaround ────────────────────────────────
     // FlutterViewController.createTouchRateCorrectionVSyncClientIfNeeded
     // null-dereferences at offset 420 (EXC_BAD_ACCESS) on every cold launch
-    // on iOS 26 beta.  Swizzle it to a no-op before Flutter initialises.
-    // Remove once Apple ships a Flutter engine fix for iOS 26.
+    // on iOS 26 beta. Swizzle it to a no-op before Flutter initialises.
     AppDelegate.swizzleVSyncClientCreation()
 
     // ── Audio session ─────────────────────────────────────────────────────
-    // Plain playback, raw audio path: no mic, no AEC, no DSP of any kind.
-    // .allowBluetooth + .allowBluetoothA2DP enable Bluetooth output without
-    // forcing a sample-rate change.
+    // Plain playback — raw audio path, no mic, no AEC, no DSP.
+    // .allowBluetooth + .allowBluetoothA2DP enable Bluetooth output.
     do {
       try AVAudioSession.sharedInstance().setCategory(
         .playback,
@@ -32,11 +30,8 @@ import ObjectiveC
       print("[AppDelegate] AVAudioSession setup failed: \(error)")
     }
 
+    GeneratedPluginRegistrant.register(with: self)
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
-  }
-
-  func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
-    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
   }
 
   // MARK: – iOS 26 VSync crash workaround
