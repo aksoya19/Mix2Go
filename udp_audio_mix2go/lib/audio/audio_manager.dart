@@ -34,7 +34,7 @@ enum AudioState { stopped, buffering, playing, error }
 ///   • 1–3 consecutive FEC frames → isolated packet loss → Opus FEC (fine).
 ///   • ≥ 4 consecutive FEC frames (40 ms of sustained empty buffer)
 ///     → clock drift detected → enter _rebuffering:
-///       stop consuming, feed silence, wait for _kRebufferExit (3) packets
+///       stop consuming, feed silence, wait for _kPreBuffer packets
 ///       to re-accumulate, call seekToLatest(), resume at real-time.
 ///   • Opposite drift (DAW faster): buffer grows > _kOverflowPackets (150 ms)
 ///     → trim to real-time via seekToLatest().
@@ -110,10 +110,27 @@ class AudioManager {
 
   // 4 × 10 ms = 40 ms of sustained empty buffer → clock drift (not loss)
   static const int _kDriftThreshold  = 4;
-  // Minimum packets before exiting rebuffer (≥ 60 ms headroom after seek)
-  static const int _kRebufferExit    = 6;
   // Trim buffer to real-time if it grows beyond this many packets (150 ms)
   static const int _kOverflowPackets = 15;
+
+  // ── Pre-buffer depth (startup + drift recovery) ───────────────────────────
+  //
+  // Must cover the hardware fill-burst that fires right after seekToLatest():
+  //
+  //  macOS/iOS  flutter_pcm_sound fires callbacks until hardware = threshold
+  //             (80ms = 8 pkts).  Each feed = 2 pkts → 4 burst callbacks →
+  //             min needed = 4×2+1 look-ahead = 9.  Use 12 for margin.
+  //             120 ms startup / max silence per drift correction.
+  //
+  //  Windows    WinMM pre-sets all 8 headers to WHDR_DONE in start().
+  //             First poll fires 8 simultaneous callbacks × 2 pkts = 16 used.
+  //             min needed = 16+1 = 17.  Use 20 for margin.
+  //             200 ms startup / max silence per drift correction.
+  //
+  static const int _kNonWinPreBuffer = 12; // 120 ms
+  static const int _kWinPreBuffer    = 20; // 200 ms
+  static int get   _kPreBuffer       =>
+      Platform.isWindows ? _kWinPreBuffer : _kNonWinPreBuffer;
 
   // ── Stats ──────────────────────────────────────────────────────────────────
   int       _underruns     = 0;
@@ -228,7 +245,7 @@ class AudioManager {
     // _isInitializing prevents double-init if multiple packets arrive during
     // the async setup awaits.
     if (_currentState == AudioState.buffering &&
-        _buffer.isReady && !_isInitializing) {
+        _buffer.buffered >= _kPreBuffer && !_isInitializing) {
       _isInitializing = true;
       _initPlayer(); // unawaited — uses session ID guards internally
     }
@@ -306,8 +323,7 @@ class AudioManager {
       _log('▶ Playback started'
            '  sr=$_sampleRate  ch=$_numChannels'
            '  frame=${_numSamples}smp/${_frameDurationMs}ms'
-           '  threshold=${_numSamples * _numChannels * 4}smpl (40ms)'
-           '  pre-buffer=${ReorderBuffer.kPreBufferPackets}pkts (${ReorderBuffer.kPreBufferPackets * _frameDurationMs}ms)'
+           '  pre-buffer=${_kPreBuffer}pkts (${_kPreBuffer * _frameDurationMs}ms)'
            '  backend=${Platform.isWindows ? "waveOut" : "flutter_pcm_sound"}');
 
     } catch (e) {
@@ -336,9 +352,10 @@ class AudioManager {
       _didSeekToLatest      = true;
       _rebuffering          = false;
       _consecutiveUnderruns = 0;
-      // Snap to real-time: keep kPreBufferPackets (4 × 10ms = 40ms).
-      // Enough for the initial threshold-fill burst without adding latency.
-      _buffer.seekToLatest();
+      // Snap to real-time keeping _kPreBuffer packets so the immediate
+      // hardware fill burst (macOS: ~4 callbacks, Windows: 8 simultaneous)
+      // consumes real audio instead of FEC silence → no startup clicks.
+      _buffer.seekToLatest(_kPreBuffer);
       _feedQueue.clear();
     }
 
@@ -349,7 +366,7 @@ class AudioManager {
     // unbounded latency creep.
     if (!_rebuffering && _buffer.buffered > _kOverflowPackets) {
       final before = _buffer.buffered;
-      _buffer.seekToLatest(ReorderBuffer.kPreBufferPackets);
+      _buffer.seekToLatest(_kPreBuffer);
       _feedQueue.clear();
       _consecutiveUnderruns = 0;
       _log('Overflow trim: $before→${_buffer.buffered}pkts — drift corrected');
@@ -422,18 +439,20 @@ class AudioManager {
   ///   pre-buffer    → silence (hardware keeps running without a click)
   ///   normal        → real frame from buffer, reset drift counter
   ///   isolated loss → Opus FEC concealment (1–[_kDriftThreshold-1] gaps)
-  ///   clock drift   → enter _rebuffering; silence until [_kRebufferExit]
+  ///   clock drift   → enter _rebuffering; silence until [_kPreBuffer]
   ///                   packets re-accumulate; seekToLatest(); resume
   Int16List _dequeueNextFrame() {
     final silence = Int16List(_numSamples * _numChannels);
 
     // ── Rebuffer mode (clock drift recovery) ────────────────────────────────
     if (_rebuffering) {
-      if (_buffer.buffered >= _kRebufferExit) {
+      if (_buffer.buffered >= _kPreBuffer) {
         // Enough packets accumulated — snap to real-time and resume.
+        // Keep _kPreBuffer so the hardware fill burst after recovery gets
+        // real audio (same logic as startup seekToLatest).
         _rebuffering          = false;
         _consecutiveUnderruns = 0;
-        _buffer.seekToLatest(ReorderBuffer.kPreBufferPackets);
+        _buffer.seekToLatest(_kPreBuffer);
         _feedQueue.clear(); // flush queued silence so real audio starts next
         _log('✓ Clock drift corrected — resuming at real-time');
       }
