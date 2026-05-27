@@ -43,11 +43,11 @@ enum AudioState { stopped, buffering, playing, error }
 ///  iOS 26 beta Dart stall mitigation
 /// ═══════════════════════════════════════════════════════════════════
 ///   The Dart event loop stalls ≤ 30 ms on UI frames (60 fps × 16.7 ms
-///   + method channel overhead).  setFeedThreshold = 4 Opus frames (40 ms)
-///   so even a 30 ms stall still leaves 10 ms in the hardware buffer before
+///   + method channel overhead).  setFeedThreshold = 8 Opus frames (80 ms)
+///   so even a 30 ms stall still leaves 50 ms in the hardware buffer before
 ///   Dart wakes and feeds 20 ms more — no underrun.
-///   Buffer oscillates 40–60 ms.  With 20 ms pre-buffer and ~5 ms network,
-///   end-to-end latency ≈ 65 ms (closest iOS 26 beta allows stably).
+///   Buffer oscillates 80–100 ms.  With 10 ms frames, 40 ms pre-buffer and
+///   ~5 ms network, end-to-end latency ≈ 65 ms (10+5+40+10).
 ///
 /// ═══════════════════════════════════════════════════════════════════
 ///  Session ID guard (stop/start race)
@@ -108,14 +108,14 @@ class AudioManager {
   bool _rebuffering          = false;
   int  _consecutiveUnderruns = 0;
 
-  // 2 × 20 ms = 40 ms of sustained empty buffer → clock drift (not loss).
-  // With 20 ms frames, 4 consecutive gaps would be 80 ms of FEC artifacts
-  // before reacting — far too long.  2 is the minimum safe value.
-  static const int _kDriftThreshold  = 2;
+  // 4 × 10 ms = 40 ms of sustained empty buffer → clock drift (not loss).
+  // With 10 ms frames, 2 consecutive gaps (20 ms) can occur from normal jitter
+  // — too many false positives.  4 gaps (40 ms) matches the old 2×20ms threshold.
+  static const int _kDriftThreshold  = 4;
   // Minimum packets before exiting rebuffer.
-  // 4 × 20 ms = 80 ms headroom after seekToLatest — enough to survive
+  // 6 × 10 ms = 60 ms headroom after seekToLatest — enough to survive
   // the next onFeedNeeded draining 3 frames again.
-  static const int _kRebufferExit    = 4;
+  static const int _kRebufferExit    = 6;
   // Trim buffer to real-time if it grows beyond this many packets (150 ms)
   static const int _kOverflowPackets = 15;
 
@@ -296,11 +296,13 @@ class AudioManager {
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
         // setFeedThreshold unit = audio frames (samples per channel), NOT
-        // total Int16 values.  4 × _numSamples = 4 × 20 ms = 80 ms.
+        // total Int16 values.  8 × _numSamples = 8 × 10 ms = 80 ms.
         // iOS 26 Dart stalls ≤ 30 ms → after stall, 50 ms still in hardware
-        // → Dart wakes and feeds 2 more frames (40 ms) → no underrun.
+        // → Dart wakes and feeds 2 more frames (20 ms) → no underrun.
+        // With 10 ms frames a 4× multiplier only gives 40 ms — too close to
+        // the 30 ms stall; 8× (80 ms) provides the same safety margin as before.
         await FlutterPcmSound.setFeedThreshold(
-          _numSamples * 4, // audio frames (per channel), NOT * numChannels
+          _numSamples * 8, // audio frames (per channel), NOT * numChannels
         );
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
@@ -369,8 +371,8 @@ class AudioManager {
       _log('Overflow trim: $before→${_buffer.buffered}pkts — drift corrected');
     }
 
-    // Feed 2 Opus frames (40 ms) per callback.
-    // Threshold = 4 frames (80 ms), so native buffer oscillates 80–120 ms.
+    // Feed 2 Opus frames (20 ms) per callback.
+    // Threshold = 8 frames (80 ms), so native buffer oscillates 80–100 ms.
     const kFramesPerFeed = 2;
     final feedSize = frameSize * kFramesPerFeed;
 
@@ -472,7 +474,7 @@ class AudioManager {
       _consecutiveUnderruns++;
 
       if (_consecutiveUnderruns >= _kDriftThreshold) {
-        // Buffer has been empty for _kDriftThreshold × 10 ms = 40 ms.
+        // Buffer has been empty for _kDriftThreshold × 10 ms = 40 ms (4 gaps).
         // This is clock drift, not random packet loss.
         _rebuffering = true;
         _log('⚠ Clock drift: ${_consecutiveUnderruns} consecutive gaps '

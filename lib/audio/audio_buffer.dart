@@ -10,7 +10,7 @@ import 'dart:typed_data';
 /// Thread safety: all methods must be called from the same Dart isolate.
 class ReorderBuffer {
   /// Packets to accumulate before [consume] is allowed to return real data.
-  /// 4 × 20 ms = 80 ms of pre-roll / jitter absorption.
+  /// 4 × 10 ms = 40 ms of pre-roll / jitter absorption.
   /// Must be > kFramesPerFeed (2) + look-ahead (1) = 3, so the first
   /// onFeedNeeded call can drain 3 frames without hitting a gap.
   static const int kPreBufferPackets = 4;
