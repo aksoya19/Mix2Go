@@ -336,9 +336,9 @@ class AudioManager {
       _didSeekToLatest      = true;
       _rebuffering          = false;
       _consecutiveUnderruns = 0;
-      // Keep 6 packets (60 ms) for the initial threshold-fill burst.
-      // threshold=40ms / feed=20ms → 2 rapid callbacks × 3 packets each.
-      _buffer.seekToLatest(6);
+      // Snap to real-time: keep kPreBufferPackets (4 × 10ms = 40ms).
+      // Enough for the initial threshold-fill burst without adding latency.
+      _buffer.seekToLatest();
       _feedQueue.clear();
     }
 
