@@ -284,10 +284,12 @@ class AudioManager {
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
         // Threshold unit = frames (samples per channel).
-        // 4 × 480 = 1920 frames = 40 ms @ 48 kHz.
-        // iOS Dart stalls ≤ 30 ms → still 10 ms left in hardware → no underrun.
+        // 8 × 480 = 3840 frames = 80 ms @ 48 kHz.
+        // Dart stalls up to 50 ms on macOS (GC, system load) → 80 ms threshold
+        // leaves 30 ms in hardware after worst-case stall → no underrun.
+        // 4× (40 ms) is too tight: a 50 ms stall drains the buffer completely.
         await FlutterPcmSound.setFeedThreshold(
-          _numSamples * 4, // 40 ms — NOT * numChannels (unit is frames/ch)
+          _numSamples * 8, // 80 ms — NOT * numChannels (unit is frames/ch)
         );
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
