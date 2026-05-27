@@ -101,6 +101,8 @@ class AudioManager {
   int  _callbackSessionId = -1;  // snapshot when callback registered
   bool _isInitializing    = false; // prevents double _initPlayer()
   bool _didSeekToLatest   = false; // seek happens on first feed callback
+  bool _needsSettleDelay  = false; // true after release() — AVAudioSession
+                                   // needs ~300ms to re-init cleanly
 
   // ── Adaptive jitter buffer / clock drift correction ────────────────────────
   bool _rebuffering          = false;
@@ -108,8 +110,8 @@ class AudioManager {
 
   // 4 × 10 ms = 40 ms of sustained empty buffer → clock drift (not loss)
   static const int _kDriftThreshold  = 4;
-  // Minimum packets before exiting rebuffer (≥ 30 ms headroom after seek)
-  static const int _kRebufferExit    = 3;
+  // Minimum packets before exiting rebuffer (≥ 60 ms headroom after seek)
+  static const int _kRebufferExit    = 6;
   // Trim buffer to real-time if it grows beyond this many packets (150 ms)
   static const int _kOverflowPackets = 15;
 
@@ -178,6 +180,9 @@ class AudioManager {
       // callback that fires during teardown hits a harmless handler.
       try { FlutterPcmSound.setFeedCallback((_) {}); } catch (_) {}
       try { await FlutterPcmSound.release(); } catch (_) {}
+      // AVAudioSession needs ~300 ms to deactivate fully before a new
+      // AudioUnit can be created cleanly.
+      _needsSettleDelay = true;
     }
 
     _callbackSessionId    = -1;
@@ -250,6 +255,13 @@ class AudioManager {
     final sid = _sessionId; // snapshot — changes if stop()+start() races us
 
     try {
+      if (_needsSettleDelay) {
+        _needsSettleDelay = false;
+        if (!_stillBuffering(sid)) { _isInitializing = false; return; }
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (!_stillBuffering(sid)) { _isInitializing = false; return; }
+      }
+
       if (Platform.isWindows) {
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
         _winAudio = WindowsAudioOutput();
@@ -271,22 +283,22 @@ class AudioManager {
         );
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
-        // 4 frames × 10 ms = 40 ms threshold.
-        // iOS 26 Dart stalls ≤ 30 ms → 10 ms still in hardware when Dart
-        // wakes → feeds 20 ms more → no audible underrun.
+        // Threshold unit = frames (samples per channel).
+        // 4 × 480 = 1920 frames = 40 ms @ 48 kHz.
+        // iOS Dart stalls ≤ 30 ms → still 10 ms left in hardware → no underrun.
         await FlutterPcmSound.setFeedThreshold(
-          _numSamples * _numChannels * 4,
+          _numSamples * 4, // 40 ms — NOT * numChannels (unit is frames/ch)
         );
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
-        // Register callback and set state BEFORE the native engine can fire.
+        // Register callback then manually prime the AudioUnit.
+        // flutter_pcm_sound only calls AudioOutputUnitStart() inside feed().
+        // Without this prime the AudioUnit sits idle forever and onFeedNeeded
+        // is never fired by the native engine.
         _callbackSessionId = sid;
         _updateState(AudioState.playing);
         FlutterPcmSound.setFeedCallback(_onFeedNeeded);
-        // Do NOT call FlutterPcmSound.start() or prime manually.
-        // The native engine fires onFeedNeeded itself after setup;
-        // a manual prime creates a second simultaneous feed chain → comb
-        // filter artifacts immediately on start.
+        _onFeedNeeded(0); // prime: starts AudioUnit + does seekToLatest
       }
 
       _log('▶ Playback started'
@@ -322,7 +334,9 @@ class AudioManager {
       _didSeekToLatest      = true;
       _rebuffering          = false;
       _consecutiveUnderruns = 0;
-      _buffer.seekToLatest();
+      // Keep 6 packets (60 ms) for the initial threshold-fill burst.
+      // threshold=40ms / feed=20ms → 2 rapid callbacks × 3 packets each.
+      _buffer.seekToLatest(6);
       _feedQueue.clear();
     }
 
