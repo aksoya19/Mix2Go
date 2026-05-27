@@ -101,6 +101,8 @@ class AudioManager {
   int  _callbackSessionId = -1;  // snapshot when callback registered
   bool _isInitializing    = false; // prevents double _initPlayer()
   bool _didSeekToLatest   = false; // seek happens on first feed callback
+  bool _needsSettleDelay  = false; // true after release() — iOS AVAudioSession
+                                   // needs ~300ms to settle before reinit
 
   // ── Adaptive jitter buffer / clock drift correction ────────────────────────
   bool _rebuffering          = false;
@@ -186,6 +188,9 @@ class AudioManager {
       // callback that fires during teardown hits a harmless handler.
       try { FlutterPcmSound.setFeedCallback((_) {}); } catch (_) {}
       try { await FlutterPcmSound.release(); } catch (_) {}
+      // Mark that the AVAudioSession was deactivated; _initPlayer() will
+      // insert a settle delay before the next AudioUnit creation.
+      _needsSettleDelay = true;
     }
 
     _callbackSessionId    = -1;
@@ -258,6 +263,17 @@ class AudioManager {
     final sid = _sessionId; // snapshot — changes if stop()+start() races us
 
     try {
+      // After release(), iOS needs ~300 ms for the AVAudioSession to fully
+      // deactivate before a new AudioUnit can be created cleanly.  Without
+      // this delay, fast stop→start cycles produce 1-2 s of underruns.
+      // The delay is skipped on the very first start (no previous release).
+      if (_needsSettleDelay) {
+        _needsSettleDelay = false;
+        if (!_stillBuffering(sid)) { _isInitializing = false; return; }
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (!_stillBuffering(sid)) { _isInitializing = false; return; }
+      }
+
       if (Platform.isWindows) {
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
         _winAudio = WindowsAudioOutput();
