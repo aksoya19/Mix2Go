@@ -1,0 +1,26 @@
+name: udp_audio_mix2go
+description: "Mix2Go – Receive and play back Opus-encoded DAW audio over UDP."
+publish_to: 'none'
+version: 2.0.0+1
+
+environment:
+  sdk: ^3.10.7
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  udp: ^5.0.3
+  flutter_pcm_sound: ^3.3.3
+  opus_flutter: ^3.0.3
+  opus_dart: ^3.0.1
+  ffi: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
