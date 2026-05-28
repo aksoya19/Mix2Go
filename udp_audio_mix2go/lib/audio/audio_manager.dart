@@ -105,10 +105,16 @@ class AudioManager {
                                    // needs ~300ms to re-init cleanly
 
   // ── Adaptive jitter buffer / clock drift correction ────────────────────────
-  bool _rebuffering          = false;
-  int  _consecutiveUnderruns = 0;
+  bool _rebuffering             = false;
+  int  _consecutiveUnderruns    = 0;
+  // Set to true by _dequeueNextFrame() when it returns a real decoded frame.
+  // Reset to false at the start of each _onFeedNeeded() call.
+  // _consecutiveUnderruns is then updated ONCE per callback (not per dequeue),
+  // so the 2-3 look-ahead dequeues don't inflate the counter 2-3×.
+  bool _hadRealFrameThisCallback = false;
 
-  // 4 × 10 ms = 40 ms of sustained empty buffer → clock drift (not loss)
+  // 4 × kFramesPerFeed × frameDurationMs = 4 × 20ms = 80ms of sustained
+  // all-empty callbacks → clock drift detected (not isolated packet loss).
   static const int _kDriftThreshold  = 4;
   // Trim buffer to real-time if it grows beyond this many packets (150 ms)
   static const int _kOverflowPackets = 15;
@@ -160,13 +166,14 @@ class AudioManager {
 
     _buffer.reset();
     _feedQueue.clear();
-    _fadingOut            = false;
-    _fadeGain             = 1.0;
-    _isInitializing       = false;
-    _didSeekToLatest      = false;
-    _rebuffering          = false;
-    _consecutiveUnderruns = 0;
-    _underruns            = 0;
+    _fadingOut                = false;
+    _fadeGain                 = 1.0;
+    _isInitializing           = false;
+    _didSeekToLatest          = false;
+    _rebuffering              = false;
+    _consecutiveUnderruns     = 0;
+    _hadRealFrameThisCallback = false;
+    _underruns                = 0;
     _totalFedMs           = 0;
     _bytesReceived        = 0;
     _startTime            = null;
@@ -202,11 +209,12 @@ class AudioManager {
       _needsSettleDelay = true;
     }
 
-    _callbackSessionId    = -1;
-    _isInitializing       = false;
-    _didSeekToLatest      = false;
-    _rebuffering          = false;
-    _consecutiveUnderruns = 0;
+    _callbackSessionId        = -1;
+    _isInitializing           = false;
+    _didSeekToLatest          = false;
+    _rebuffering              = false;
+    _consecutiveUnderruns     = 0;
+    _hadRealFrameThisCallback = false;
     _buffer.reset();
     _feedQueue.clear();
     _fadingOut  = false;
@@ -359,6 +367,15 @@ class AudioManager {
       _feedQueue.clear();
     }
 
+    // Reset per-callback gap flag.  _dequeueNextFrame() sets this to true
+    // when it returns a real decoded frame.  We use it below (after the
+    // drain loop) to update _consecutiveUnderruns ONCE per callback rather
+    // than once per dequeue — the look-ahead refill calls _dequeueNextFrame
+    // 2-3 times per callback, so per-dequeue counting inflated the counter
+    // 2-3× and triggered drift detection after only 1-2 empty callbacks
+    // (20-40 ms) instead of 4 (80 ms).
+    _hadRealFrameThisCallback = false;
+
     final frameSize = _numSamples * _numChannels; // Int16 values per Opus frame
 
     // Overflow trim: DAW clock faster than iOS → buffer grows over time.
@@ -373,7 +390,7 @@ class AudioManager {
     }
 
     // Feed 2 Opus frames (20 ms) per callback.
-    // Threshold = 4 frames (40 ms), so native buffer oscillates 40–60 ms.
+    // Threshold = 80 ms, so native buffer oscillates 80–100 ms.
     const kFramesPerFeed = 2;
     final feedSize = frameSize * kFramesPerFeed;
 
@@ -395,6 +412,25 @@ class AudioManager {
         _feedQueue.addFirst(Int16List.sublistView(chunk, take));
       }
       pos += take;
+    }
+
+    // ── Per-callback consecutive underrun tracking ─────────────────────────
+    // Update ONCE after all dequeue calls so the look-ahead (+1 frame) doesn't
+    // count gaps 2-3× per callback.  If ANY real frame arrived this callback,
+    // reset the streak.  If ALL dequeues returned FEC/silence, increment.
+    if (!_rebuffering) {
+      if (_hadRealFrameThisCallback) {
+        _consecutiveUnderruns = 0;
+      } else {
+        _consecutiveUnderruns++;
+        if (_consecutiveUnderruns >= _kDriftThreshold) {
+          _rebuffering = true;
+          _log('⚠ Clock drift: $_consecutiveUnderruns '
+               '× ${_frameDurationMs * kFramesPerFeed}ms empty callbacks '
+               '(${_consecutiveUnderruns * _frameDurationMs * kFramesPerFeed}ms)'
+               ' — rebuffering…');
+        }
+      }
     }
 
     // EOS fade-out.
@@ -467,23 +503,15 @@ class AudioManager {
     final (frame, needsFec) = _buffer.consume();
 
     if (frame != null) {
-      _consecutiveUnderruns = 0; // real frame → reset drift counter
+      // Signal to _onFeedNeeded that this callback had at least one real frame
+      // so it resets _consecutiveUnderruns rather than incrementing it.
+      _hadRealFrameThisCallback = true;
       return frame;
     }
 
     // ── Sequence gap ─────────────────────────────────────────────────────────
     if (needsFec) {
-      _underruns++;
-      _consecutiveUnderruns++;
-
-      if (_consecutiveUnderruns >= _kDriftThreshold) {
-        // Buffer has been empty for _kDriftThreshold × 10 ms = 40 ms.
-        // This is clock drift, not random packet loss.
-        _rebuffering = true;
-        _log('⚠ Clock drift: ${_consecutiveUnderruns} consecutive gaps '
-             '(${_consecutiveUnderruns * _frameDurationMs}ms) — rebuffering…');
-        return silence;
-      }
+      _underruns++; // total FEC count for stats
 
       // Isolated packet loss: Opus FEC concealment.
       // MUST use the shared decoder from _receiver (has real packet history).
