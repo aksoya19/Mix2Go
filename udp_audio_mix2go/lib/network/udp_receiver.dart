@@ -44,9 +44,14 @@ class Mix2GoPacket {
 class UdpReceiver {
   UDP? _socket;
   SimpleOpusDecoder? _opusDecoder;
-  bool _isRunning = false;
+  bool _isRunning   = false;
+  int  _actualPort  = 0;
 
-  bool get isRunning => _isRunning;
+  bool get isRunning   => _isRunning;
+
+  /// The port the OS actually bound to (may differ from the requested port
+  /// when port=0 is passed and the OS assigns a free port).
+  int  get actualPort  => _actualPort;
 
   /// Shared Opus decoder — exposed so AudioManager can call
   /// decode(input: null) for FEC concealment on packet gaps.
@@ -54,8 +59,10 @@ class UdpReceiver {
   /// packet; a fresh decoder produces noise/garbage.
   SimpleOpusDecoder? get opusDecoder => _opusDecoder;
 
+  /// [port] = 0 → OS picks any free port (zero collision risk).
+  /// After a successful bind, [actualPort] holds the real port number.
   Future<void> start({
-    required int port,
+    int port = 0,
     required void Function(Mix2GoPacket packet) onPacket,
     void Function(int sequenceNumber)? onEos,
   }) async {
@@ -63,8 +70,11 @@ class UdpReceiver {
 
     try {
       _socket = await UDP.bind(Endpoint.any(port: Port(port)));
-      _isRunning = true;
-      print('[UDP] Receiver started on port $port (v2 / Opus)');
+      // The UDP package wraps a RawDatagramSocket; .port gives the real
+      // OS-assigned port (essential when port=0 was requested).
+      _actualPort = _socket!.socket?.port ?? port;
+      _isRunning  = true;
+      print('[UDP] Receiver started on port $_actualPort (v2 / Opus)');
 
       _socket!.asStream().listen(
         (datagram) {
@@ -89,10 +99,11 @@ class UdpReceiver {
   void stop() {
     if (!_isRunning) return;
     _socket?.close();
-    _socket = null;
+    _socket      = null;
     _opusDecoder?.destroy();
     _opusDecoder = null;
-    _isRunning = false;
+    _isRunning   = false;
+    _actualPort  = 0;
     print('[UDP] Receiver stopped');
   }
 

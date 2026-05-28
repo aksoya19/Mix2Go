@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import '../network/udp_receiver.dart';
+import '../network/discovery_announcer.dart';
 import 'audio_buffer.dart';
 import 'windows_audio_output.dart';
 
@@ -59,8 +60,9 @@ enum AudioState { stopped, buffering, playing, error }
 ///   callbacks from the previous session self-abort on the first line of
 ///   _onFeedNeeded.
 class AudioManager {
-  final UdpReceiver   _receiver = UdpReceiver();
-  final ReorderBuffer _buffer   = ReorderBuffer();
+  final UdpReceiver        _receiver   = UdpReceiver();
+  final ReorderBuffer      _buffer     = ReorderBuffer();
+  final DiscoveryAnnouncer _announcer  = DiscoveryAnnouncer();
   WindowsAudioOutput? _winAudio;
 
   // ── Streams ────────────────────────────────────────────────────────────────
@@ -158,7 +160,9 @@ class AudioManager {
   // Public API
   // ══════════════════════════════════════════════════════════════════════════
 
-  Future<void> start(int port) async {
+  /// Bind to any free UDP port (port 0 → OS assigns), then broadcast the
+  /// actual port via [DiscoveryAnnouncer] so the VST auto-discovers this device.
+  Future<void> start() async {
     if (_currentState != AudioState.stopped) return;
 
     // Increment session ID first — invalidates any lingering callbacks.
@@ -174,26 +178,31 @@ class AudioManager {
     _consecutiveUnderruns     = 0;
     _hadRealFrameThisCallback = false;
     _underruns                = 0;
-    _totalFedMs           = 0;
-    _bytesReceived        = 0;
-    _startTime            = null;
+    _totalFedMs               = 0;
+    _bytesReceived            = 0;
+    _startTime                = null;
 
     _updateState(AudioState.buffering);
-    _log('Listening on UDP port $port…');
 
     try {
+      // port 0 → OS picks any free port → zero collision risk.
       await _receiver.start(
-        port: port,
+        port:     0,
         onPacket: _handlePacket,
         onEos:    _handleEos,
       );
+      final int actualPort = _receiver.actualPort;
+      _log('Listening on UDP port $actualPort — broadcasting for VST auto-discovery…');
+      // Broadcast our port every second so the VST can find us automatically.
+      await _announcer.start(actualPort);
     } catch (e) {
-      _log('Error binding port $port: $e');
+      _log('Error starting receiver: $e');
       _updateState(AudioState.error);
     }
   }
 
   Future<void> stop() async {
+    _announcer.stop(); // stop broadcasting before closing the audio socket
     _receiver.stop();
 
     if (Platform.isWindows) {
