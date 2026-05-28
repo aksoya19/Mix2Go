@@ -3,10 +3,11 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
+  opus_flutter_windows
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
-  mp_audio_stream
+  jni
 )
 
 set(PLUGIN_BUNDLED_LIBRARIES)

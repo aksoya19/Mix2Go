@@ -1,0 +1,28 @@
+PODS:
+  - Flutter (1.0.0)
+  - flutter_pcm_sound (0.0.1):
+    - Flutter
+  - opus_flutter_ios (0.0.2):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - flutter_pcm_sound (from `.symlinks/plugins/flutter_pcm_sound/ios`)
+  - opus_flutter_ios (from `.symlinks/plugins/opus_flutter_ios/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  flutter_pcm_sound:
+    :path: ".symlinks/plugins/flutter_pcm_sound/ios"
+  opus_flutter_ios:
+    :path: ".symlinks/plugins/opus_flutter_ios/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  flutter_pcm_sound: e9c2f6ce580eefcab2af46763f0354484d5c4ac8
+  opus_flutter_ios: 6c80747e297077787910a39146d698a15a37c82a
+
+PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e
+
+COCOAPODS: 1.16.2
