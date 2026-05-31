@@ -9,33 +9,34 @@ import 'package:flutter/foundation.dart';
 ///   ASCII payload sent as raw bytes:  `MIX2GO:2:<audioPort>`
 ///   e.g.                              `MIX2GO:2:43210`
 ///
-///   Destination: 255.255.255.255:[kDiscoveryPort]  (UDP limited broadcast)
-///   Interval:    every [kIntervalMs] ms
-///
-/// The VST plugin listens on [kDiscoveryPort].  On receipt it reads the
-/// sender's IP from the datagram source address and [audioPort] from the
-/// payload, then auto-starts streaming to that endpoint.
+///   Sends to TWO addresses every interval:
+///     1. 255.255.255.255       (limited broadcast  — works on most LANs)
+///     2. `<subnet>.255`        (directed broadcast — gets through routers
+///                               that block 255.255.255.255, computed from
+///                               the device's own IP assuming a /24 subnet)
+///   Interval: every [kIntervalMs] ms
 /// ─────────────────────────────────────────────────────────────────────────
 class DiscoveryAnnouncer {
-  /// The VST plugin listens on this port for discovery broadcasts.
-  /// Obscure enough that port collisions are extremely unlikely.
   static const int kDiscoveryPort = 40051;
-
-  /// How often to broadcast (ms).
-  static const int kIntervalMs = 1000;
+  static const int kIntervalMs    = 1000;
 
   RawDatagramSocket? _socket;
   Timer?             _timer;
   int                _audioPort = 0;
+  String?            _subnetBroadcast; // e.g. "192.168.0.255"
 
   bool get isRunning => _timer != null;
 
   // ── Public API ───────────────────────────────────────────────────────────
 
-  /// Open a broadcast socket and start sending [audioPort] every second.
   Future<void> start(int audioPort) async {
     if (isRunning) return;
     _audioPort = audioPort;
+
+    // Calculate the subnet-directed broadcast address (assumes /24).
+    _subnetBroadcast = await _getSubnetBroadcast();
+    debugPrint('[Discovery] subnet broadcast: $_subnetBroadcast');
+
     try {
       _socket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4, 0,
@@ -46,19 +47,16 @@ class DiscoveryAnnouncer {
       _send();
       _timer = Timer.periodic(
         const Duration(milliseconds: kIntervalMs), (_) => _send());
-      debugPrint('[Discovery] Broadcasting audioPort=$_audioPort'
-                 ' → 255.255.255.255:$kDiscoveryPort every ${kIntervalMs}ms');
+      debugPrint('[Discovery] Broadcasting port=$_audioPort'
+                 ' every ${kIntervalMs}ms');
     } catch (e) {
       debugPrint('[Discovery] Could not open broadcast socket: $e');
     }
   }
 
-  /// Stop broadcasting and release the socket.
   void stop() {
-    _timer?.cancel();
-    _timer = null;
-    _socket?.close();
-    _socket = null;
+    _timer?.cancel(); _timer = null;
+    _socket?.close(); _socket = null;
     debugPrint('[Discovery] Stopped');
   }
 
@@ -66,10 +64,44 @@ class DiscoveryAnnouncer {
 
   void _send() {
     if (_socket == null) return;
-    final bytes = Uint8List.fromList('MIX2GO:2:$_audioPort'.codeUnits);
+    final bytes = List<int>.from('MIX2GO:2:$_audioPort'.codeUnits);
+
+    // 1) Limited broadcast — delivered on local segment
+    _sendTo('255.255.255.255', bytes);
+
+    // 2) Subnet-directed broadcast — passes through routers that block 255.255.255.255
+    //    and often gets through WiFi APs with "client isolation" enabled.
+    if (_subnetBroadcast != null && _subnetBroadcast != '255.255.255.255') {
+      _sendTo(_subnetBroadcast!, bytes);
+    }
+  }
+
+  void _sendTo(String address, List<int> bytes) {
     try {
       _socket!.send(
-        bytes, InternetAddress('255.255.255.255'), kDiscoveryPort);
+        bytes, InternetAddress(address), kDiscoveryPort);
     } catch (_) {}
+  }
+
+  /// Returns the subnet-directed broadcast for the first non-loopback IPv4
+  /// interface (assumes /24).  Falls back to '255.255.255.255'.
+  static Future<String> _getSubnetBroadcast() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          final parts = addr.address.split('.');
+          if (parts.length == 4) {
+            return '${parts[0]}.${parts[1]}.${parts[2]}.255';
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('[Discovery] Could not determine subnet broadcast: $e');
+    }
+    return '255.255.255.255';
   }
 }
