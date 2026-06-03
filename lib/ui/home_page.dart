@@ -12,20 +12,23 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final AudioManager _manager = AudioManager();
-  final TextEditingController _portCtrl = TextEditingController(text: '12345');
 
   AudioState _state       = AudioState.stopped;
-  String     _statusMsg   = 'Bereit';
+  String     _statusMsg   = 'Ready';
   Timer?     _statsTimer;
+
+  // Network info shown in UI
+  int    _listenPort   = 0;
+  String _deviceIP     = '';
 
   // Stats shown in UI
   int    _buffered     = 0;
   double _lossRate     = 0;
   double _bitrate      = 0;
-  int    _rawReceived  = 0;  // raw UDP datagrams (before magic check)
-  int    _decoded      = 0;  // successfully Opus-decoded frames
-  String _headerInfo   = ''; // header fields from last packet
-  String _opusError    = ''; // last Opus decode error
+  int    _rawReceived  = 0;
+  int    _decoded      = 0;
+  String _headerInfo   = '';
+  String _opusError    = '';
 
   @override
   void initState() {
@@ -37,19 +40,19 @@ class _HomePageState extends State<HomePage> {
         _state = state;
         switch (state) {
           case AudioState.stopped:
-            _statusMsg = 'Gestoppt';
+            _statusMsg = 'Stopped';
             _stopStatsTimer();
             break;
           case AudioState.buffering:
-            _statusMsg = 'Pufferung… (${ReorderBuffer.kPreBufferPackets} Pakete)';
-            _startStatsTimer(); // also poll during buffering for diagnostics
+            _statusMsg = 'Buffering... (${ReorderBuffer.kPreBufferPackets} packets)';
+            _startStatsTimer();
             break;
           case AudioState.playing:
-            _statusMsg = 'Wiedergabe läuft';
+            _statusMsg = 'Playing';
             _startStatsTimer();
             break;
           case AudioState.error:
-            _statusMsg = 'Fehler';
+            _statusMsg = 'Error';
             _stopStatsTimer();
             break;
         }
@@ -65,7 +68,6 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _stopStatsTimer();
     _manager.dispose();
-    _portCtrl.dispose();
     super.dispose();
   }
 
@@ -73,6 +75,8 @@ class _HomePageState extends State<HomePage> {
     _statsTimer ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
       if (!mounted) return;
       setState(() {
+        _listenPort  = _manager.listenPort;
+        _deviceIP    = _manager.deviceIP;
         _buffered    = _manager.buffered;
         _lossRate    = _manager.lossRate;
         _bitrate     = _manager.bitrateKbps;
@@ -81,18 +85,16 @@ class _HomePageState extends State<HomePage> {
         _headerInfo  = _manager.lastHeaderInfo;
         _opusError   = _manager.lastOpusError;
 
-        // During buffering: update status to show network diagnostic counts.
         if (_state == AudioState.buffering) {
           if (_rawReceived == 0) {
-            _statusMsg = 'Warte auf UDP-Pakete… (Port ${_portCtrl.text})';
+            _statusMsg = 'Waiting for UDP packets...';
           } else if (_decoded == 0) {
-            // Show header info so we can diagnose the Opus failure
             _statusMsg = _headerInfo.isNotEmpty
-                ? 'Opus-Fehler! $_headerInfo'
-                : 'Pakete empfangen ($_rawReceived) — Opus-Fehler!';
+                ? 'Opus error! $_headerInfo'
+                : 'Packets received ($_rawReceived) — Opus error!';
           } else {
-            _statusMsg = 'Pufferung… $_decoded/${ReorderBuffer.kPreBufferPackets} '
-                         'Pakete ($_rawReceived roh)';
+            _statusMsg = 'Buffering... $_decoded/${ReorderBuffer.kPreBufferPackets} '
+                         'packets ($_rawReceived raw)';
           }
         }
       });
@@ -108,12 +110,7 @@ class _HomePageState extends State<HomePage> {
     if (_state != AudioState.stopped) {
       await _manager.stop();
     } else {
-      final port = int.tryParse(_portCtrl.text);
-      if (port == null) {
-        setState(() => _statusMsg = 'Ungültiger Port');
-        return;
-      }
-      await _manager.start(port);
+      await _manager.start();
     }
   }
 
@@ -123,10 +120,10 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final bool active = _state != AudioState.stopped;
     final Color stateColor = switch (_state) {
-      AudioState.stopped  => Colors.grey,
+      AudioState.stopped   => Colors.grey,
       AudioState.buffering => Colors.amber,
-      AudioState.playing  => Colors.green,
-      AudioState.error    => Colors.red,
+      AudioState.playing   => Colors.green,
+      AudioState.error     => Colors.red,
     };
 
     return Scaffold(
@@ -166,26 +163,17 @@ class _HomePageState extends State<HomePage> {
 
                 const SizedBox(height: 32),
 
-                // Port input
-                TextField(
-                  controller: _portCtrl,
-                  enabled: !active,
-                  keyboardType: TextInputType.number,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    labelText: 'UDP-Port',
-                    labelStyle: const TextStyle(color: Colors.white54),
-                    border: const OutlineInputBorder(),
-                    enabledBorder: OutlineInputBorder(
-                        borderSide: BorderSide(color: Colors.white24)),
-                    disabledBorder: OutlineInputBorder(
-                        borderSide: BorderSide(color: Colors.white12)),
-                    focusedBorder: OutlineInputBorder(
-                        borderSide: BorderSide(color: stateColor)),
+                // Network info card (visible when active)
+                AnimatedOpacity(
+                  opacity: active ? 1.0 : 0.0,
+                  duration: const Duration(milliseconds: 300),
+                  child: _NetworkInfoCard(
+                    deviceIP:   _deviceIP,
+                    listenPort: _listenPort,
                   ),
                 ),
 
-                const SizedBox(height: 20),
+                SizedBox(height: active ? 20.0 : 0.0),
 
                 // Start / Stop button
                 SizedBox(
@@ -194,14 +182,17 @@ class _HomePageState extends State<HomePage> {
                     onPressed: _toggleStart,
                     style: ElevatedButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 16),
-                      backgroundColor: active ? Colors.red.shade700 : Colors.blue.shade700,
+                      backgroundColor: active
+                          ? Colors.red.shade700
+                          : Colors.blue.shade700,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(8)),
                     ),
                     child: Text(
-                      active ? 'Stop' : 'Empfang starten',
-                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      active ? 'Stop' : 'Start receiving',
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold),
                     ),
                   ),
                 ),
@@ -226,6 +217,72 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+// ── Network info card ──────────────────────────────────────────────────────────
+// Shows the device IP and auto-assigned port so the user can enter them in the
+// Mix2Go VST as a manual fallback when auto-discovery is blocked by the router.
+
+class _NetworkInfoCard extends StatelessWidget {
+  const _NetworkInfoCard({
+    required this.deviceIP,
+    required this.listenPort,
+  });
+
+  final String deviceIP;
+  final int    listenPort;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F3460),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.blueAccent.withValues(alpha: .4)),
+      ),
+      child: Column(
+        children: [
+          const Text(
+            'Enter in Mix2Go VST:',
+            style: TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          // Device IP
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Text('IP: ',
+                  style: TextStyle(color: Colors.white54, fontSize: 14)),
+              Text(
+                deviceIP.isNotEmpty ? deviceIP : '...',
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: 'monospace'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          // Port — shown large so it's easy to read and type
+          Text(
+            listenPort > 0 ? '$listenPort' : '...',
+            style: TextStyle(
+              color: listenPort > 0 ? Colors.lightBlueAccent : Colors.white38,
+              fontSize: 48,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 4,
+            ),
+          ),
+          const Text(
+            'UDP port',
+            style: TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+        ],
       ),
     );
   }
@@ -265,8 +322,8 @@ class _StatsPanel extends StatelessWidget {
         children: [
           // Buffer bar
           _StatRow(
-            label: 'Puffer',
-            value: '$buffered Pakete / ${buffered * 20} ms',
+            label: 'Buffer',
+            value: '$buffered packets / ${buffered * 20} ms',
             child: LinearProgressIndicator(
               value: maxBuffer > 0 ? buffered / maxBuffer : 0,
               backgroundColor: Colors.white12,
@@ -278,7 +335,7 @@ class _StatsPanel extends StatelessWidget {
 
           // Loss rate
           _StatRow(
-            label: 'Paketverlust',
+            label: 'Packet loss',
             value: '${(lossRate * 100).toStringAsFixed(1)} %',
             child: LinearProgressIndicator(
               value: lossRate.clamp(0.0, 1.0),
@@ -294,28 +351,31 @@ class _StatsPanel extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('Bitrate', style: TextStyle(color: Colors.white60, fontSize: 13)),
+              const Text('Bitrate',
+                  style: TextStyle(color: Colors.white60, fontSize: 13)),
               Text('${bitrate.toStringAsFixed(0)} kbps',
-                  style: const TextStyle(color: Colors.white, fontSize: 13,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
                       fontWeight: FontWeight.w600)),
             ],
           ),
           const SizedBox(height: 12),
 
-          // Network diagnostic row: raw UDP vs decoded Opus
+          // Network diagnostic: raw UDP vs decoded Opus
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('UDP roh / dekodiert',
+              const Text('UDP raw / decoded',
                   style: TextStyle(color: Colors.white60, fontSize: 13)),
               Text(
                 '$rawReceived / $decoded',
                 style: TextStyle(
                   color: rawReceived == 0
-                      ? Colors.red        // nothing arrived at all
+                      ? Colors.red
                       : decoded == 0
-                          ? Colors.orange // arrived but Opus decode failed
-                          : Colors.green, // all good
+                          ? Colors.orange
+                          : Colors.green,
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
                 ),
@@ -357,9 +417,13 @@ class _StatRow extends StatelessWidget {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(label, style: const TextStyle(color: Colors.white60, fontSize: 13)),
-            Text(value,  style: const TextStyle(color: Colors.white,   fontSize: 13,
-                fontWeight: FontWeight.w600)),
+            Text(label,
+                style: const TextStyle(color: Colors.white60, fontSize: 13)),
+            Text(value,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600)),
           ],
         ),
         const SizedBox(height: 4),
