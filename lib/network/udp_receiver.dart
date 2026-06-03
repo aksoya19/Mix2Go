@@ -66,6 +66,11 @@ class UdpReceiver {
 
   bool get isRunning => _isRunning;
 
+  /// The actual UDP port the socket is bound to (0 if not running).
+  /// NOTE: UDP.local returns the *requested* endpoint (port 0 when OS-assigned),
+  /// so we must read the actual port from the underlying RawDatagramSocket.
+  int get actualPort => _socket?.socket?.port ?? 0;
+
   /// Shared Opus decoder — exposed so AudioManager can call
   /// decode(input: null) for FEC concealment on packet gaps.
   /// FEC REQUIRES the same decoder instance that decoded the last real

@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:io' show Platform;
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import '../network/udp_receiver.dart';
+import '../network/discovery_announcer.dart';
 import 'audio_buffer.dart';
 import 'windows_audio_output.dart';
 
@@ -31,13 +32,21 @@ enum AudioState { stopped, buffering, playing, error }
 ///   1-bit / buzzy artifacts that never recover on their own.
 ///
 ///   Fix: adaptive rebuffer mode.
-///   • 1–3 consecutive FEC frames → isolated packet loss → Opus FEC (fine).
-///   • ≥ 4 consecutive FEC frames (40 ms of sustained empty buffer)
+///   • 1–3 consecutive empty CALLBACKS → isolated jitter → Opus FEC (fine).
+///   • ≥ _kDriftThreshold consecutive empty CALLBACKS (80 ms sustained)
 ///     → clock drift detected → enter _rebuffering:
-///       stop consuming, feed silence, wait for _kRebufferExit (3) packets
+///       stop consuming, feed silence, wait for _kPreBuffer packets
 ///       to re-accumulate, call seekToLatest(), resume at real-time.
 ///   • Opposite drift (DAW faster): buffer grows > _kOverflowPackets (150 ms)
 ///     → trim to real-time via seekToLatest().
+///
+///   IMPORTANT: the drift counter is updated ONCE per feed callback, NOT
+///   once per _dequeueNextFrame() call.  The look-ahead refill loop calls
+///   _dequeueNextFrame() 2-3 times per callback, so per-dequeue counting
+///   inflated the counter 2-3× and triggered drift detection after only
+///   ~30 ms of WiFi jitter (3 empty dequeues = counter 9 > threshold 8)
+///   — turning normal WiFi hiccups into 120 ms of forced silence.
+///   This was the root cause of the audible stutter.
 ///
 /// ═══════════════════════════════════════════════════════════════════
 ///  iOS 26 beta Dart stall mitigation
@@ -46,8 +55,27 @@ enum AudioState { stopped, buffering, playing, error }
 ///   + method channel overhead).  setFeedThreshold = 8 Opus frames (80 ms)
 ///   so even a 30 ms stall still leaves 50 ms in the hardware buffer before
 ///   Dart wakes and feeds 20 ms more — no underrun.
-///   Buffer oscillates 80–100 ms.  With 10 ms frames, 40 ms pre-buffer and
-///   ~5 ms network, end-to-end latency ≈ 65 ms (10+5+40+10).
+///   Buffer oscillates 80–100 ms.  With 10 ms frames, 120 ms pre-buffer and
+///   ~5 ms network, end-to-end latency ≈ 215 ms (10+5+120+80).
+///
+/// ═══════════════════════════════════════════════════════════════════
+///  Pre-buffer depth (startup + drift recovery)
+/// ═══════════════════════════════════════════════════════════════════
+///   Must cover the hardware fill-burst that fires right after seekToLatest():
+///
+///    macOS/iOS  flutter_pcm_sound fires callbacks until hardware = threshold
+///               (80 ms = 8 pkts).  Each feed = 2 pkts → 4 burst callbacks →
+///               min needed = 4×2 + 1 look-ahead = 9.  Use 12 for margin.
+///               120 ms startup / max silence per drift correction.
+///
+///    Windows    WinMM pre-sets all 8 headers to WHDR_DONE in start().
+///               First poll fires 8 simultaneous callbacks × 2 pkts = 16 used.
+///               min needed = 16 + 1 = 17.  Use 20 for margin.
+///               200 ms startup / max silence per drift correction.
+///
+///   Using only 6 packets here (the OLD default that was wrong) starves the
+///   buffer during the startup burst → FEC concealment fires → drift counter
+///   spikes → rebuffer mode triggers within seconds of pressing play.
 ///
 /// ═══════════════════════════════════════════════════════════════════
 ///  Session ID guard (stop/start race)
@@ -59,9 +87,13 @@ enum AudioState { stopped, buffering, playing, error }
 ///   callbacks from the previous session self-abort on the first line of
 ///   _onFeedNeeded.
 class AudioManager {
-  final UdpReceiver   _receiver = UdpReceiver();
-  final ReorderBuffer _buffer   = ReorderBuffer();
+  final UdpReceiver        _receiver = UdpReceiver();
+  final ReorderBuffer      _buffer   = ReorderBuffer();
+  final DiscoveryAnnouncer _announcer = DiscoveryAnnouncer();
   WindowsAudioOutput? _winAudio;
+
+  // Cached device IP resolved once per session start (sync getter for UI).
+  String _cachedDeviceIP = '';
 
   // ── Streams ────────────────────────────────────────────────────────────────
   final StreamController<AudioState> _stateCtrl =
@@ -105,19 +137,33 @@ class AudioManager {
                                    // needs ~300ms to settle before reinit
 
   // ── Adaptive jitter buffer / clock drift correction ────────────────────────
-  bool _rebuffering          = false;
-  int  _consecutiveUnderruns = 0;
+  bool _rebuffering             = false;
+  int  _consecutiveUnderruns    = 0;
+  // Set to true by _dequeueNextFrame() when it returns a real decoded frame.
+  // Reset to false at the start of each _onFeedNeeded() call.
+  // _consecutiveUnderruns is then updated ONCE per callback (not per dequeue),
+  // so the 2-3 look-ahead dequeues don't inflate the counter 2-3×.
+  bool _hadRealFrameThisCallback = false;
 
-  // 4 × 10 ms = 40 ms of sustained empty buffer → clock drift (not loss).
-  // With 10 ms frames, 2 consecutive gaps (20 ms) can occur from normal jitter
-  // — too many false positives.  4 gaps (40 ms) matches the old 2×20ms threshold.
+  // 4 × kFramesPerFeed × frameDurationMs = 4 × 40 ms = 160 ms of sustained
+  // all-empty callbacks → clock drift detected (not isolated packet loss).
+  // This is COUNTED PER CALLBACK, not per dequeue — see _hadRealFrameThisCallback.
   static const int _kDriftThreshold  = 4;
-  // Minimum packets before exiting rebuffer.
-  // 6 × 10 ms = 60 ms headroom after seekToLatest — enough to survive
-  // the next onFeedNeeded draining 3 frames again.
-  static const int _kRebufferExit    = 6;
-  // Trim buffer to real-time if it grows beyond this many packets (150 ms)
+  // Trim buffer to real-time if it grows beyond this many packets (150 ms).
   static const int _kOverflowPackets = 15;
+
+  // ── Pre-buffer depth (startup + drift recovery) ───────────────────────────
+  //
+  // See class header for derivation.  The key insight: flutter_pcm_sound /
+  // WinMM both fire a BURST of feed callbacks right after the first feed,
+  // until the hardware buffer reaches setFeedThreshold.  Each callback
+  // dequeues 2 packets, so 4 burst callbacks (macOS/iOS) consume 8 packets
+  // + 1 look-ahead = 9 minimum.  Using 12 for margin.
+  //
+  static const int _kNonWinPreBuffer = 12; // 120 ms
+  static const int _kWinPreBuffer    = 20; // 200 ms
+  static int get   _kPreBuffer       =>
+      Platform.isWindows ? _kWinPreBuffer : _kNonWinPreBuffer;
 
   // ── Stats ──────────────────────────────────────────────────────────────────
   int       _underruns     = 0;
@@ -139,11 +185,18 @@ class AudioManager {
     return secs > 0 ? (_bytesReceived * 8) / (secs * 1000) : 0;
   }
 
+  /// The actual UDP port the app is listening on (OS-assigned).
+  /// Show this to the user so they can enter it in the Mix2Go VST (manual fallback).
+  int    get listenPort => _receiver.actualPort;
+
+  /// Cached WiFi IP of this device (prefer en0, updated on every start()).
+  String get deviceIP   => _cachedDeviceIP;
+
   // ══════════════════════════════════════════════════════════════════════════
   // Public API
   // ══════════════════════════════════════════════════════════════════════════
 
-  Future<void> start(int port) async {
+  Future<void> start() async {
     if (_currentState != AudioState.stopped) return;
 
     // Increment session ID first — invalidates any lingering callbacks.
@@ -151,34 +204,46 @@ class AudioManager {
 
     _buffer.reset();
     _feedQueue.clear();
-    _fadingOut            = false;
-    _fadeGain             = 1.0;
-    _isInitializing       = false;
-    _didSeekToLatest      = false;
-    _rebuffering          = false;
-    _consecutiveUnderruns = 0;
-    _underruns            = 0;
-    _totalFedMs           = 0;
-    _bytesReceived        = 0;
-    _startTime            = null;
+    _fadingOut                = false;
+    _fadeGain                 = 1.0;
+    _isInitializing           = false;
+    _didSeekToLatest          = false;
+    _rebuffering              = false;
+    _consecutiveUnderruns     = 0;
+    _hadRealFrameThisCallback = false;
+    _underruns                = 0;
+    _totalFedMs               = 0;
+    _bytesReceived            = 0;
+    _startTime                = null;
+    _cachedDeviceIP           = '';
 
     _updateState(AudioState.buffering);
-    _log('Listening on UDP port $port…');
+    _log('Binding on UDP port 0 (OS-assigned)...');
 
     try {
+      // Port 0 = OS assigns a free port; read it back via _receiver.actualPort.
       await _receiver.start(
-        port: port,
+        port:     0,
         onPacket: _handlePacket,
         onEos:    _handleEos,
       );
+
+      // Resolve and cache this device's WiFi IP for display.
+      _cachedDeviceIP = await _resolveDeviceIP();
+
+      // Start broadcasting so the VST can auto-discover us.
+      await _announcer.start(_receiver.actualPort);
+
+      _log('Listening on port ${_receiver.actualPort}  IP: $_cachedDeviceIP');
     } catch (e) {
-      _log('Error binding port $port: $e');
+      _log('Error starting receiver: $e');
       _updateState(AudioState.error);
     }
   }
 
   Future<void> stop() async {
     _receiver.stop();
+    _announcer.stop();
 
     if (Platform.isWindows) {
       try { await _winAudio?.release(); } catch (_) {}
@@ -193,11 +258,12 @@ class AudioManager {
       _needsSettleDelay = true;
     }
 
-    _callbackSessionId    = -1;
-    _isInitializing       = false;
-    _didSeekToLatest      = false;
-    _rebuffering          = false;
-    _consecutiveUnderruns = 0;
+    _callbackSessionId        = -1;
+    _isInitializing           = false;
+    _didSeekToLatest          = false;
+    _rebuffering              = false;
+    _consecutiveUnderruns     = 0;
+    _hadRealFrameThisCallback = false;
     _buffer.reset();
     _feedQueue.clear();
     _fadingOut  = false;
@@ -232,11 +298,15 @@ class AudioManager {
     _buffer.add(packet.sequenceNumber, packet.samples,
                 packet.numSamples, packet.numChannels);
 
-    // Trigger player init once the pre-buffer is full.
+    // Trigger player init once enough packets have accumulated to survive
+    // the immediate hardware fill burst.  ReorderBuffer.isReady fires at
+    // kPreBufferPackets (6), which is NOT enough on its own — the startup
+    // burst dequeues ~9 packets back-to-back, so wait for _kPreBuffer (12)
+    // packets before initialising the player.
     // _isInitializing prevents double-init if multiple packets arrive during
     // the async setup awaits.
     if (_currentState == AudioState.buffering &&
-        _buffer.isReady && !_isInitializing) {
+        _buffer.buffered >= _kPreBuffer && !_isInitializing) {
       _isInitializing = true;
       _initPlayer(); // unawaited — uses session ID guards internally
     }
@@ -296,13 +366,15 @@ class AudioManager {
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
         // setFeedThreshold unit = audio frames (samples per channel), NOT
-        // total Int16 values.  8 × _numSamples = 8 × 10 ms = 80 ms.
-        // iOS 26 Dart stalls ≤ 30 ms → after stall, 50 ms still in hardware
-        // → Dart wakes and feeds 2 more frames (20 ms) → no underrun.
-        // With 10 ms frames a 4× multiplier only gives 40 ms — too close to
-        // the 30 ms stall; 8× (80 ms) provides the same safety margin as before.
+        // total Int16 values.  6 × _numSamples = 6 × 10 ms = 60 ms.
+        // iOS 26 Dart stalls ≤ 30 ms → after stall, 30 ms still in hardware
+        // → Dart wakes and feeds 4 more frames (40 ms) → no underrun.
+        // Threshold 60 ms with 40 ms feed → buffer oscillates 60–100 ms.
+        // CRITICAL: a higher threshold (8×) causes a longer startup burst that
+        // drains the 12-packet jitter buffer before the plugin refills it,
+        // triggering rebuffering immediately and creating a permanent loop.
         await FlutterPcmSound.setFeedThreshold(
-          _numSamples * 8, // audio frames (per channel), NOT * numChannels
+          _numSamples * 6, // audio frames (per channel), NOT * numChannels
         );
         if (!_stillBuffering(sid)) { _isInitializing = false; return; }
 
@@ -324,8 +396,9 @@ class AudioManager {
       _log('▶ Playback started'
            '  sr=$_sampleRate  ch=$_numChannels'
            '  frame=${_numSamples}smp/${_frameDurationMs}ms'
-           '  threshold=${_numSamples * 4}frm (${_frameDurationMs * 4}ms)'
-           '  pre-buffer=${ReorderBuffer.kPreBufferPackets}pkts (${ReorderBuffer.kPreBufferPackets * _frameDurationMs}ms)'
+           '  threshold=${_numSamples * 6}frm (${_frameDurationMs * 6}ms)'
+           '  feed=4pkts/${_frameDurationMs * 4}ms'
+           '  pre-buffer=${_kPreBuffer}pkts (${_kPreBuffer * _frameDurationMs}ms)'
            '  backend=${Platform.isWindows ? "waveOut" : "flutter_pcm_sound"}');
 
     } catch (e) {
@@ -350,13 +423,26 @@ class AudioManager {
     // and snap to the latest frame so playback starts at real-time.
     // This MUST happen on the first callback, not at init time, because all
     // queued UDP events drain between _initPlayer() and the first callback.
+    //
+    // Keep _kPreBuffer packets so the immediate hardware fill burst
+    // (macOS/iOS: ~4 callbacks back-to-back, Windows: 8 simultaneous polls)
+    // consumes real audio instead of FEC silence → no startup clicks/stutter.
     if (!_didSeekToLatest) {
       _didSeekToLatest      = true;
       _rebuffering          = false;
       _consecutiveUnderruns = 0;
-      _buffer.seekToLatest();
+      _buffer.seekToLatest(_kPreBuffer);
       _feedQueue.clear();
     }
+
+    // Reset per-callback gap flag.  _dequeueNextFrame() sets this to true
+    // when it returns a real decoded frame.  We use it below (after the
+    // drain loop) to update _consecutiveUnderruns ONCE per callback rather
+    // than once per dequeue — the look-ahead refill calls _dequeueNextFrame
+    // 2-3 times per callback, so per-dequeue counting inflated the counter
+    // 2-3× and triggered drift detection after only 1-2 empty callbacks
+    // (20-40 ms) instead of 4 (80 ms).  THIS WAS THE STUTTER BUG.
+    _hadRealFrameThisCallback = false;
 
     final frameSize = _numSamples * _numChannels; // Int16 values per Opus frame
 
@@ -365,15 +451,17 @@ class AudioManager {
     // unbounded latency creep.
     if (!_rebuffering && _buffer.buffered > _kOverflowPackets) {
       final before = _buffer.buffered;
-      _buffer.seekToLatest(ReorderBuffer.kPreBufferPackets);
+      _buffer.seekToLatest(_kPreBuffer);
       _feedQueue.clear();
       _consecutiveUnderruns = 0;
       _log('Overflow trim: $before→${_buffer.buffered}pkts — drift corrected');
     }
 
-    // Feed 2 Opus frames (20 ms) per callback.
-    // Threshold = 8 frames (80 ms), so native buffer oscillates 80–100 ms.
-    const kFramesPerFeed = 2;
+    // Feed 4 Opus frames (40 ms) per callback.
+    // Threshold = 6 frames (60 ms), so native buffer oscillates 60–100 ms.
+    // 4 frames per feed keeps the startup burst short (only 2 callbacks needed
+    // to fill the native buffer) so the 12-packet jitter buffer isn't drained.
+    const kFramesPerFeed = 4;
     final feedSize = frameSize * kFramesPerFeed;
 
     // Refill internal queue to hold kFramesPerFeed+1 frames of look-ahead.
@@ -394,6 +482,25 @@ class AudioManager {
         _feedQueue.addFirst(Int16List.sublistView(chunk, take));
       }
       pos += take;
+    }
+
+    // ── Per-callback consecutive underrun tracking ─────────────────────────
+    // Update ONCE after all dequeue calls so the look-ahead (+1 frame) doesn't
+    // count gaps 2-3× per callback.  If ANY real frame arrived this callback,
+    // reset the streak.  If ALL dequeues returned FEC/silence, increment.
+    if (!_rebuffering) {
+      if (_hadRealFrameThisCallback) {
+        _consecutiveUnderruns = 0;
+      } else {
+        _consecutiveUnderruns++;
+        if (_consecutiveUnderruns >= _kDriftThreshold) {
+          _rebuffering = true;
+          _log('⚠ Buffer empty: $_consecutiveUnderruns '
+               '× ${_frameDurationMs * kFramesPerFeed}ms empty callbacks '
+               '(${_consecutiveUnderruns * _frameDurationMs * kFramesPerFeed}ms total)'
+               ' — rebuffering…');
+        }
+      }
     }
 
     // EOS fade-out.
@@ -436,20 +543,27 @@ class AudioManager {
   ///
   /// State machine:
   ///   pre-buffer    → silence (hardware keeps running without a click)
-  ///   normal        → real frame from buffer, reset drift counter
-  ///   isolated loss → Opus FEC concealment (1–[_kDriftThreshold-1] gaps)
-  ///   clock drift   → enter _rebuffering; silence until [_kRebufferExit]
-  ///                   packets re-accumulate; seekToLatest(); resume
+  ///   normal        → real frame from buffer, set _hadRealFrameThisCallback
+  ///   isolated loss → Opus FEC concealment
+  ///   clock drift   → enter _rebuffering (decided in _onFeedNeeded, NOT here);
+  ///                   silence until _kPreBuffer packets re-accumulate;
+  ///                   seekToLatest(); resume
+  ///
+  /// NOTE: this function NEVER decides on its own to enter rebuffer mode.
+  /// That decision is made in _onFeedNeeded() based on a per-CALLBACK count,
+  /// not per-dequeue.  See _hadRealFrameThisCallback for the why.
   Int16List _dequeueNextFrame() {
     final silence = Int16List(_numSamples * _numChannels);
 
     // ── Rebuffer mode (clock drift recovery) ────────────────────────────────
     if (_rebuffering) {
-      if (_buffer.buffered >= _kRebufferExit) {
+      if (_buffer.buffered >= _kPreBuffer) {
         // Enough packets accumulated — snap to real-time and resume.
+        // Keep _kPreBuffer so the hardware fill burst after recovery gets
+        // real audio (same logic as startup seekToLatest).
         _rebuffering          = false;
         _consecutiveUnderruns = 0;
-        _buffer.seekToLatest(ReorderBuffer.kPreBufferPackets);
+        _buffer.seekToLatest(_kPreBuffer);
         _feedQueue.clear(); // flush queued silence so real audio starts next
         _log('✓ Clock drift corrected — resuming at real-time');
       }
@@ -464,23 +578,15 @@ class AudioManager {
     final (frame, needsFec) = _buffer.consume();
 
     if (frame != null) {
-      _consecutiveUnderruns = 0; // real frame → reset drift counter
+      // Signal to _onFeedNeeded that this callback had at least one real frame
+      // so it resets _consecutiveUnderruns rather than incrementing it.
+      _hadRealFrameThisCallback = true;
       return frame;
     }
 
     // ── Sequence gap ─────────────────────────────────────────────────────────
     if (needsFec) {
-      _underruns++;
-      _consecutiveUnderruns++;
-
-      if (_consecutiveUnderruns >= _kDriftThreshold) {
-        // Buffer has been empty for _kDriftThreshold × 10 ms = 40 ms (4 gaps).
-        // This is clock drift, not random packet loss.
-        _rebuffering = true;
-        _log('⚠ Clock drift: ${_consecutiveUnderruns} consecutive gaps '
-             '(${_consecutiveUnderruns * _frameDurationMs}ms) — rebuffering…');
-        return silence;
-      }
+      _underruns++; // total FEC count for stats
 
       // Isolated packet loss: Opus FEC concealment.
       // MUST use the shared decoder from _receiver (has real packet history).
@@ -497,6 +603,36 @@ class AudioManager {
   // ══════════════════════════════════════════════════════════════════════════
   // Helpers
   // ══════════════════════════════════════════════════════════════════════════
+
+  /// Returns the best IPv4 address of this device.
+  /// Prefers en0 (always WiFi on iOS), skips link-local (169.254) and loopback.
+  static Future<String> _resolveDeviceIP() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type:             InternetAddressType.IPv4,
+        includeLinkLocal: false,
+        includeLoopback:  false,
+      );
+      // Pass 1 — en0 (WiFi on iOS/macOS)
+      for (final iface in interfaces) {
+        if (iface.name != 'en0') continue;
+        for (final addr in iface.addresses) {
+          final ip = addr.address;
+          if (!ip.startsWith('169.254.') && !ip.startsWith('127.')) return ip;
+        }
+      }
+      // Pass 2 — any routable address
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          final ip = addr.address;
+          if (!ip.startsWith('169.254.') && !ip.startsWith('127.')) return ip;
+        }
+      }
+    } catch (e) {
+      debugPrint('[AudioManager] IP lookup failed: $e');
+    }
+    return '';
+  }
 
   void _applyFade(Int16List buf) {
     for (int i = 0; i < buf.length; i++) {

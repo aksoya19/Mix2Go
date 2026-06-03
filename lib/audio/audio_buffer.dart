@@ -10,10 +10,12 @@ import 'dart:typed_data';
 /// Thread safety: all methods must be called from the same Dart isolate.
 class ReorderBuffer {
   /// Packets to accumulate before [consume] is allowed to return real data.
-  /// 4 × 10 ms = 40 ms of pre-roll / jitter absorption.
-  /// Must be > kFramesPerFeed (2) + look-ahead (1) = 3, so the first
-  /// onFeedNeeded call can drain 3 frames without hitting a gap.
-  static const int kPreBufferPackets = 4;
+  /// 6 × 10 ms = 60 ms of pre-roll / jitter absorption.
+  /// Raised from 4 to 6: gives an extra 20 ms of headroom against WiFi jitter
+  /// and bursty DAW delivery (large buffer sizes) before the drift counter
+  /// starts climbing toward _kDriftThreshold.
+  /// Must be > kFramesPerFeed (2) + look-ahead (1) = 3.
+  static const int kPreBufferPackets = 6;
 
   /// Hard cap on buffered packets — oldest evicted when exceeded.
   /// 150 × 10 ms = 1.5 s maximum buffer depth.
