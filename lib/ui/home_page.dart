@@ -22,13 +22,16 @@ class _HomePageState extends State<HomePage> {
   String _deviceIP     = '';
 
   // Stats shown in UI
-  int    _buffered     = 0;
-  double _lossRate     = 0;
-  double _bitrate      = 0;
-  int    _rawReceived  = 0;
-  int    _decoded      = 0;
-  String _headerInfo   = '';
-  String _opusError    = '';
+  int    _buffered        = 0;
+  double _lossRate        = 0;
+  double _bitrate         = 0;
+  int    _rawReceived     = 0;
+  int    _decoded         = 0;
+  String _headerInfo      = '';
+  String _opusError       = '';
+  int    _underruns       = 0;
+  int    _frameDurationMs = 10;
+  bool   _rebuffering     = false;
 
   @override
   void initState() {
@@ -75,15 +78,18 @@ class _HomePageState extends State<HomePage> {
     _statsTimer ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
       if (!mounted) return;
       setState(() {
-        _listenPort  = _manager.listenPort;
-        _deviceIP    = _manager.deviceIP;
-        _buffered    = _manager.buffered;
-        _lossRate    = _manager.lossRate;
-        _bitrate     = _manager.bitrateKbps;
-        _rawReceived = _manager.rawDatagramsReceived;
-        _decoded     = _manager.validPacketsDecoded;
-        _headerInfo  = _manager.lastHeaderInfo;
-        _opusError   = _manager.lastOpusError;
+        _listenPort      = _manager.listenPort;
+        _deviceIP        = _manager.deviceIP;
+        _buffered        = _manager.buffered;
+        _lossRate        = _manager.lossRate;
+        _bitrate         = _manager.bitrateKbps;
+        _rawReceived     = _manager.rawDatagramsReceived;
+        _decoded         = _manager.validPacketsDecoded;
+        _headerInfo      = _manager.lastHeaderInfo;
+        _opusError       = _manager.lastOpusError;
+        _underruns       = _manager.underruns;
+        _frameDurationMs = _manager.frameDurationMs;
+        _rebuffering     = _manager.isRebuffering;
 
         if (_state == AudioState.buffering) {
           if (_rawReceived == 0) {
@@ -204,13 +210,16 @@ class _HomePageState extends State<HomePage> {
                   opacity: active ? 1.0 : 0.0,
                   duration: const Duration(milliseconds: 300),
                   child: _StatsPanel(
-                    buffered:    _buffered,
-                    maxBuffer:   ReorderBuffer.kMaxPackets,
-                    lossRate:    _lossRate,
-                    bitrate:     _bitrate,
-                    rawReceived: _rawReceived,
-                    decoded:     _decoded,
-                    opusError:   _opusError,
+                    buffered:        _buffered,
+                    maxBuffer:       ReorderBuffer.kMaxPackets,
+                    lossRate:        _lossRate,
+                    bitrate:         _bitrate,
+                    rawReceived:     _rawReceived,
+                    decoded:         _decoded,
+                    opusError:       _opusError,
+                    underruns:       _underruns,
+                    frameDurationMs: _frameDurationMs,
+                    rebuffering:     _rebuffering,
                   ),
                 ),
               ],
@@ -299,15 +308,18 @@ class _StatsPanel extends StatelessWidget {
     required this.rawReceived,
     required this.decoded,
     required this.opusError,
+    required this.underruns,
+    required this.frameDurationMs,
+    required this.rebuffering,
   });
 
-  final int    buffered;
-  final int    maxBuffer;
-  final double lossRate;
-  final double bitrate;
-  final int    rawReceived;
-  final int    decoded;
+  final int    buffered, maxBuffer, rawReceived, decoded, underruns, frameDurationMs;
+  final double lossRate, bitrate;
   final String opusError;
+  final bool   rebuffering;
+
+  // hardware avg (T=60ms + F/2=20ms) + Opus frame (10ms) + network (5ms)
+  int get _estimatedLatencyMs => buffered * frameDurationMs + 95;
 
   @override
   Widget build(BuildContext context) {
@@ -320,10 +332,47 @@ class _StatsPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Latency estimate
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('Est. latency',
+                  style: TextStyle(color: Colors.white60, fontSize: 13)),
+              Row(children: [
+                if (rebuffering)
+                  Container(
+                    margin: const EdgeInsets.only(right: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.withValues(alpha: .2),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: Colors.orange),
+                    ),
+                    child: const Text('REBUFFERING',
+                        style: TextStyle(color: Colors.orange, fontSize: 10,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                Text('${_estimatedLatencyMs} ms',
+                    style: TextStyle(
+                        color: _estimatedLatencyMs < 150 ? Colors.green
+                            : _estimatedLatencyMs < 250 ? Colors.amber
+                            : Colors.red,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold)),
+              ]),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text('jitter ${buffered * frameDurationMs}ms + ~115ms overhead',
+              style: const TextStyle(color: Colors.white30, fontSize: 11)),
+          const SizedBox(height: 12),
+          const Divider(color: Colors.white12, height: 1),
+          const SizedBox(height: 12),
+
           // Buffer bar
           _StatRow(
-            label: 'Buffer',
-            value: '$buffered packets / ${buffered * 20} ms',
+            label: 'Jitter buffer',
+            value: '$buffered pkts / ${buffered * frameDurationMs}ms',
             child: LinearProgressIndicator(
               value: maxBuffer > 0 ? buffered / maxBuffer : 0,
               backgroundColor: Colors.white12,
@@ -344,6 +393,21 @@ class _StatsPanel extends StatelessWidget {
                 lossRate < 0.05 ? Colors.green
                     : lossRate < 0.15 ? Colors.amber : Colors.red),
             ),
+          ),
+          const SizedBox(height: 12),
+
+          // FEC underruns
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('FEC underruns',
+                  style: TextStyle(color: Colors.white60, fontSize: 13)),
+              Text('$underruns',
+                  style: TextStyle(
+                      color: underruns == 0 ? Colors.green : Colors.orange,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
+            ],
           ),
           const SizedBox(height: 12),
 

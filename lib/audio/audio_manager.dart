@@ -148,9 +148,18 @@ class AudioManager {
   // 4 × kFramesPerFeed × frameDurationMs = 4 × 40 ms = 160 ms of sustained
   // all-empty callbacks → clock drift detected (not isolated packet loss).
   // This is COUNTED PER CALLBACK, not per dequeue — see _hadRealFrameThisCallback.
-  static const int _kDriftThreshold  = 4;
-  // Trim buffer to real-time if it grows beyond this many packets (150 ms).
-  static const int _kOverflowPackets = 15;
+  // Raised to 8: with a deep (~90 ms) buffer, brief jitter bursts ride through
+  // on the buffer itself — only a genuine sustained drain triggers rebuffering
+  // (which is an audible gap, worse than an FEC tick we want to avoid anyway).
+  static const int _kDriftThreshold  = 8;
+  // Trim only when drift grows the buffer ~50 ms above steady. Far enough above
+  // _kSteadyBuffer(9) that the trim (which clears the feed queue) fires only
+  // every several minutes under clock drift, not on normal jitter.
+  static const int _kOverflowPackets = 14;
+  // Steady-state target the overflow trim / rebuffer-recovery seeks to.
+  // 9 packets = 90 ms of jitter absorption — deep enough that hotspot jitter
+  // spikes rarely exceed it, so FEC fires only on genuine loss.
+  static const int _kSteadyBuffer    = 9; // 90 ms jitter headroom
 
   // ── Pre-buffer depth (startup + drift recovery) ───────────────────────────
   //
@@ -160,8 +169,11 @@ class AudioManager {
   // dequeues 2 packets, so 4 burst callbacks (macOS/iOS) consume 8 packets
   // + 1 look-ahead = 9 minimum.  Using 12 for margin.
   //
-  static const int _kNonWinPreBuffer = 12; // 120 ms
-  static const int _kWinPreBuffer    = 20; // 200 ms
+  // One-time startup depth. The hardware fill-burst consumes ~9 packets right
+  // after the first feed, so 18 here lands the steady-state buffer at ~9
+  // (= _kSteadyBuffer) — deep enough to absorb hotspot jitter so FEC is rare.
+  static const int _kNonWinPreBuffer = 18; // 180 ms startup → ~90 ms steady
+  static const int _kWinPreBuffer    = 24; // 240 ms startup
   static int get   _kPreBuffer       =>
       Platform.isWindows ? _kWinPreBuffer : _kNonWinPreBuffer;
 
@@ -175,6 +187,8 @@ class AudioManager {
   int    get buffered              => _buffer.buffered;
   double get lossRate              => _buffer.lossRate;
   bool   get isRebuffering        => _rebuffering;
+  int    get underruns            => _underruns;
+  int    get frameDurationMs      => _frameDurationMs;
   int    get rawDatagramsReceived => _receiver.rawDatagramsReceived;
   int    get validPacketsDecoded  => _receiver.validPacketsDecoded;
   String get lastOpusError        => _receiver.lastOpusError;
@@ -447,11 +461,12 @@ class AudioManager {
     final frameSize = _numSamples * _numChannels; // Int16 values per Opus frame
 
     // Overflow trim: DAW clock faster than iOS → buffer grows over time.
-    // If it exceeds _kOverflowPackets (150 ms), seek to real-time to prevent
-    // unbounded latency creep.
+    // Trim to _kSteadyBuffer (low) — NOT _kPreBuffer — so steady-state latency
+    // stays down. This is the fix for the buffer parking at the 120 ms startup
+    // depth and never coming back down.
     if (!_rebuffering && _buffer.buffered > _kOverflowPackets) {
       final before = _buffer.buffered;
-      _buffer.seekToLatest(_kPreBuffer);
+      _buffer.seekToLatest(_kSteadyBuffer);
       _feedQueue.clear();
       _consecutiveUnderruns = 0;
       _log('Overflow trim: $before→${_buffer.buffered}pkts — drift corrected');
@@ -558,12 +573,12 @@ class AudioManager {
     // ── Rebuffer mode (clock drift recovery) ────────────────────────────────
     if (_rebuffering) {
       if (_buffer.buffered >= _kPreBuffer) {
-        // Enough packets accumulated — snap to real-time and resume.
-        // Keep _kPreBuffer so the hardware fill burst after recovery gets
-        // real audio (same logic as startup seekToLatest).
+        // Wait for a healthy buffer (confidence the stream is back), then snap
+        // to the LOW steady target — the hardware is still primed from the
+        // silence feed, so there's no post-recovery burst to survive.
         _rebuffering          = false;
         _consecutiveUnderruns = 0;
-        _buffer.seekToLatest(_kPreBuffer);
+        _buffer.seekToLatest(_kSteadyBuffer);
         _feedQueue.clear(); // flush queued silence so real audio starts next
         _log('✓ Clock drift corrected — resuming at real-time');
       }

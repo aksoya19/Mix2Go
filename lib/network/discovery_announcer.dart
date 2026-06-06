@@ -16,14 +16,17 @@ import 'package:flutter/foundation.dart';
 ///                               the device's own IP assuming a /24 subnet)
 ///   Interval: every [kIntervalMs] ms
 /// ─────────────────────────────────────────────────────────────────────────
+// TODO: remove after presentation — proper fix would be mDNS/Bonjour
+const bool _kEnableHotspotWorkaround = true;
+
 class DiscoveryAnnouncer {
   static const int kDiscoveryPort = 40051;
   static const int kIntervalMs    = 1000;
 
   RawDatagramSocket? _socket;
   Timer?             _timer;
-  int                _audioPort = 0;
-  String?            _subnetBroadcast; // e.g. "192.168.0.255"
+  int                _audioPort   = 0;
+  List<String>       _addresses   = const [];
 
   bool get isRunning => _timer != null;
 
@@ -33,9 +36,8 @@ class DiscoveryAnnouncer {
     if (isRunning) return;
     _audioPort = audioPort;
 
-    // Calculate the subnet-directed broadcast address (assumes /24).
-    _subnetBroadcast = await _getSubnetBroadcast();
-    debugPrint('[Discovery] subnet broadcast: $_subnetBroadcast');
+    _addresses = await _collectAddresses();
+    debugPrint('[Discovery] targets: $_addresses');
 
     try {
       _socket = await RawDatagramSocket.bind(
@@ -65,14 +67,8 @@ class DiscoveryAnnouncer {
   void _send() {
     if (_socket == null) return;
     final bytes = List<int>.from('MIX2GO:2:$_audioPort'.codeUnits);
-
-    // 1) Limited broadcast — delivered on local segment
-    _sendTo('255.255.255.255', bytes);
-
-    // 2) Subnet-directed broadcast — passes through routers that block 255.255.255.255
-    //    and often gets through WiFi APs with "client isolation" enabled.
-    if (_subnetBroadcast != null && _subnetBroadcast != '255.255.255.255') {
-      _sendTo(_subnetBroadcast!, bytes);
+    for (final addr in _addresses) {
+      _sendTo(addr, bytes);
     }
   }
 
@@ -83,66 +79,45 @@ class DiscoveryAnnouncer {
     } catch (_) {}
   }
 
-  /// Returns the subnet-directed broadcast for the best non-loopback IPv4
-  /// interface (assumes /24).  Prefers routable addresses (192.168.x.x /
-  /// 10.x.x.x / 172.16-31.x.x) over link-local (169.254.x.x).
-  /// Falls back to '255.255.255.255'.
-  static Future<String> _getSubnetBroadcast() async {
+  /// Collects all addresses to send discovery broadcasts to:
+  /// - 255.255.255.255 (limited broadcast)
+  /// - <subnet>.255 per interface (directed broadcast, covers ZeroTier etc.)
+  /// - Hotspot workaround: when this device is the iPhone hotspot AP at
+  ///   172.20.10.1, iOS routes broadcast out cellular (wrong interface).
+  ///   Unicast to each possible client IP (172.20.10.2–14) is routed via
+  ///   the hotspot bridge instead and reaches the Mac correctly.
+  static Future<List<String>> _collectAddresses() async {
+    final seen = <String>{};
+    seen.add('255.255.255.255');
+
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,
       );
 
-      // Log all interfaces for debugging.
       for (final iface in interfaces) {
         for (final addr in iface.addresses) {
-          debugPrint('[Discovery] Interface ${iface.name}: ${addr.address}');
-        }
-      }
-
-      // Pass 1: prefer en0 — always WiFi on iOS/macOS.
-      for (final iface in interfaces) {
-        if (iface.name != 'en0') continue;
-        for (final addr in iface.addresses) {
-          final parts = addr.address.split('.');
-          if (parts.length == 4) {
-            final bcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
-            debugPrint('[Discovery] Selected broadcast (en0): $bcast (${addr.address})');
-            return bcast;
-          }
-        }
-      }
-
-      // Pass 2: any routable address (skip link-local 169.254.x.x and 127.x.x.x).
-      for (final iface in interfaces) {
-        for (final addr in iface.addresses) {
+          debugPrint('[Discovery] ${iface.name}: ${addr.address}');
           final parts = addr.address.split('.');
           if (parts.length != 4) continue;
-          final first  = int.tryParse(parts[0]) ?? 0;
-          final second = int.tryParse(parts[1]) ?? 0;
-          if (first == 169 && second == 254) continue;
-          if (first == 127) continue;
-          final bcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
-          debugPrint('[Discovery] Selected broadcast (routable): $bcast (${addr.address} on ${iface.name})');
-          return bcast;
-        }
-      }
 
-      // Pass 3: last resort — any non-loopback address.
-      for (final iface in interfaces) {
-        for (final addr in iface.addresses) {
-          final parts = addr.address.split('.');
-          if (parts.length == 4) {
-            final bcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
-            debugPrint('[Discovery] Fallback broadcast: $bcast');
-            return bcast;
+          final bcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
+          seen.add(bcast);
+
+          // Hotspot workaround
+          if (_kEnableHotspotWorkaround && addr.address == '172.20.10.1') {
+            for (int i = 2; i <= 14; i++) {
+              seen.add('172.20.10.$i');
+            }
+            debugPrint('[Discovery] Hotspot mode — added unicast scan 172.20.10.2-14');
           }
         }
       }
     } catch (e) {
-      debugPrint('[Discovery] Could not determine subnet broadcast: $e');
+      debugPrint('[Discovery] Interface enumeration failed: $e');
     }
-    return '255.255.255.255';
+
+    return seen.toList();
   }
 }

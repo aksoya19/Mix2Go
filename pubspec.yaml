@@ -16,6 +16,7 @@ dependencies:
   opus_flutter: ^3.0.3
   opus_dart: ^3.0.1
   ffi: ^2.1.0
+  audio_service: ^0.18.0
 
 dev_dependencies:
   flutter_test:
