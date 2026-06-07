@@ -24,7 +24,7 @@ android {
         applicationId = "com.example.udp_audio_mix2go"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        minSdk = maxOf(21, flutter.minSdkVersion) // NDK 27 (opus_flutter native) needs >=21
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
