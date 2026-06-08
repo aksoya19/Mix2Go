@@ -118,10 +118,34 @@ class ReorderBuffer {
   /// Call this before the first [consume] so playback starts at real-time
   /// rather than replaying the setup-time accumulation.
   void seekToLatest([int keepPackets = kPreBufferPackets]) {
+    if (_map.isEmpty) return;
+
+    // Keep the newest [keepPackets] BY COUNT — this preserves the buffer depth
+    // the hardware fill-burst needs (range-based trimming left it too shallow
+    // when jitter gaps were present, causing playback underruns).
     while (_map.length > keepPackets) {
       _map.remove(_map.firstKey());
     }
-    if (_map.isNotEmpty) _nextSeq = _map.firstKey();
+
+    // Then drop a FAR leading straggler: at startup the socket often gets the
+    // very first packet (seq 0), drops a burst while Flutter/Opus initialise,
+    // then catches up (seq 22+). That seq-0 outlier would anchor _nextSeq and
+    // make consume() FEC-walk the whole gap (the deterministic ~21 FEC spike).
+    // Only drop when the gap to the next packet is larger than the whole keep
+    // window — a true outlier. Small recent jitter gaps are left intact so the
+    // buffer keeps its depth.
+    while (_map.length >= 2) {
+      final it = _map.keys.iterator;
+      it.moveNext(); final first  = it.current;
+      it.moveNext(); final second = it.current;
+      if (second - first > keepPackets) {
+        _map.remove(first); // far startup straggler — discard
+      } else {
+        break;
+      }
+    }
+
+    _nextSeq = _map.firstKey();
   }
 
   // ── Reset ───────────────────────────────────────────────────────────────────
