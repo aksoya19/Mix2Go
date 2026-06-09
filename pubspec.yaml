@@ -22,6 +22,32 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/branding/mix2go_icon.png"
+  adaptive_icon_background: "#0E0E16"
+  adaptive_icon_foreground: "assets/branding/mix2go_icon_rounded.png"
+  remove_alpha_ios: true
+  macos:
+    generate: true
+    image_path: "assets/branding/mix2go_icon.png"
+  windows:
+    generate: true
+    image_path: "assets/branding/mix2go_icon.png"
 
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/branding/
+
+  fonts:
+    - family: BarlowCondensed
+      fonts:
+        - asset: assets/fonts/BarlowCondensed-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/BarlowCondensed-Bold.ttf
+          weight: 700

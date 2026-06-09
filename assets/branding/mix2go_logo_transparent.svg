@@ -1,0 +1,41 @@
+<svg width="160" height="48" viewBox="0 0 160 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="50%" stop-color="#e8445a"/>
+      <stop offset="100%" stop-color="#c026d3"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon mark (transparent bg) -->
+  <rect x="2"  y="29" width="5" height="11" rx="2.5" fill="url(#g)" opacity="0.45"/>
+  <rect x="10" y="22" width="5" height="20" rx="2.5" fill="url(#g)" opacity="0.65"/>
+  <rect x="18" y="13" width="5" height="30" rx="2.5" fill="url(#g)"/>
+  <rect x="26" y="18" width="5" height="23" rx="2.5" fill="url(#g)" opacity="0.82"/>
+  <rect x="34" y="24" width="5" height="14" rx="2.5" fill="url(#g)" opacity="0.60"/>
+  <rect x="42" y="30" width="5" height="7"  rx="2.5" fill="url(#g)" opacity="0.38"/>
+
+  <!-- Signal dot -->
+  <circle cx="46" cy="9"  r="5"  fill="url(#g)"/>
+  <circle cx="46" cy="9"  r="8"  fill="url(#g)" opacity="0.12"/>
+
+  <!-- Wordmark: MIX2GO -->
+  <text x="58" y="34"
+    font-family="'Barlow Condensed', 'Arial Narrow', Arial, sans-serif"
+    font-weight="700"
+    font-size="32"
+    letter-spacing="3"
+    fill="#EBECF0">MIX</text>
+  <text x="104" y="34"
+    font-family="'Barlow Condensed', 'Arial Narrow', Arial, sans-serif"
+    font-weight="700"
+    font-size="32"
+    letter-spacing="3"
+    fill="url(#g)">2</text>
+  <text x="121" y="34"
+    font-family="'Barlow Condensed', 'Arial Narrow', Arial, sans-serif"
+    font-weight="700"
+    font-size="32"
+    letter-spacing="3"
+    fill="#EBECF0">GO</text>
+</svg>

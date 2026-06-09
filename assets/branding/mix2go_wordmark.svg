@@ -1,0 +1,21 @@
+<svg width="400" height="80" viewBox="0 0 400 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gw" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="100%" stop-color="#e8445a"/>
+    </linearGradient>
+  </defs>
+  <!-- Icon mark small -->
+  <rect x="0" y="8" width="52" height="52" rx="10" fill="#1a1a1e"/>
+  <rect x="6"  y="34" width="5" height="14" rx="2.5" fill="url(#gw)" opacity="0.45"/>
+  <rect x="13" y="28" width="5" height="22" rx="2.5" fill="url(#gw)" opacity="0.65"/>
+  <rect x="20" y="20" width="5" height="32" rx="2.5" fill="url(#gw)"/>
+  <rect x="27" y="25" width="5" height="24" rx="2.5" fill="url(#gw)" opacity="0.82"/>
+  <rect x="34" y="31" width="5" height="14" rx="2.5" fill="url(#gw)" opacity="0.60"/>
+  <rect x="41" y="36" width="5" height="7"  rx="2.5" fill="url(#gw)" opacity="0.38"/>
+  <circle cx="47" cy="17" r="4.5" fill="url(#gw)"/>
+  <!-- Wordmark text rendered as paths would need a font — using foreignObject as fallback note -->
+  <!-- For production: convert "MIX2GO" with Barlow Condensed Bold to outlines -->
+  <text x="64" y="46" font-family="'Barlow Condensed', Arial Narrow, Arial" font-weight="700" font-size="42" letter-spacing="4" fill="#EBECF0">MIX<tspan fill="url(#gw)">2</tspan>GO</text>
+  <text x="65" y="63" font-family="Arial" font-weight="400" font-size="11" letter-spacing="3" fill="rgba(255,255,255,0.38)">AUDIO STREAMER</text>
+</svg>

@@ -2,6 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import '../audio/audio_manager.dart';
 import '../audio/audio_buffer.dart';
+import 'theme.dart';
+import 'widgets/mix2go_icon_painter.dart';
+import 'widgets/status_orb.dart';
+import 'widgets/vu_meter.dart';
+import 'widgets/toggle_row.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -13,63 +18,58 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final AudioManager _manager = AudioManager();
 
-  AudioState _state       = AudioState.stopped;
-  String     _statusMsg   = 'Ready';
-  Timer?     _statsTimer;
+  AudioState _state = AudioState.stopped;
+  Timer? _statsTimer;
+  StreamSubscription? _stateSub, _vuSub;
 
-  // Network info shown in UI
-  int    _listenPort   = 0;
-  String _deviceIP     = '';
+  // Network
+  int _listenPort = 0;
+  String _deviceIP = '';
 
-  // Stats shown in UI
-  int    _buffered        = 0;
-  double _lossRate        = 0;
-  double _bitrate         = 0;
-  int    _rawReceived     = 0;
-  int    _decoded         = 0;
-  String _headerInfo      = '';
-  String _opusError       = '';
-  int    _underruns       = 0;
-  int    _frameDurationMs = 10;
-  bool   _rebuffering     = false;
+  // Diagnostics
+  int _latency = 0;
+  double _lossRate = 0;
+  double _bitrate = 0;
+  int _decoded = 0;
+  String _opusError = '';
+  int _underruns = 0;
+  bool _rebuffering = false;
+
+  // VU — driven via a ValueNotifier so only the meter repaints (not the whole
+  // page) when levels change; full-page setState here would starve the audio.
+  final ValueNotifier<List<double>> _vu = ValueNotifier(const [0.0, 0.0]);
+
+  // Panel toggles
+  bool _showMetrics = true;
+  bool _showNetwork = false;
 
   @override
   void initState() {
     super.initState();
-
-    _manager.stateStream.listen((state) {
+    _stateSub = _manager.stateStream.listen((s) {
       if (!mounted) return;
       setState(() {
-        _state = state;
-        switch (state) {
-          case AudioState.stopped:
-            _statusMsg = 'Stopped';
-            _stopStatsTimer();
-            break;
-          case AudioState.buffering:
-            _statusMsg = 'Buffering... (${ReorderBuffer.kPreBufferPackets} packets)';
-            _startStatsTimer();
-            break;
-          case AudioState.playing:
-            _statusMsg = 'Playing';
-            _startStatsTimer();
-            break;
-          case AudioState.error:
-            _statusMsg = 'Error';
-            _stopStatsTimer();
-            break;
+        _state = s;
+        if (s == AudioState.stopped || s == AudioState.error) {
+          _stopStatsTimer();
+        } else {
+          _startStatsTimer();
         }
       });
     });
-
-    _manager.logStream.listen((log) {
-      debugPrint('AudioLog: $log');
+    _vuSub = _manager.vuStream.listen((lv) {
+      // No setState — just push to the notifier so only the meter rebuilds.
+      _vu.value = lv;
     });
+    _manager.logStream.listen((log) => debugPrint('AudioLog: $log'));
   }
 
   @override
   void dispose() {
     _stopStatsTimer();
+    _stateSub?.cancel();
+    _vuSub?.cancel();
+    _vu.dispose();
     _manager.dispose();
     super.dispose();
   }
@@ -78,31 +78,15 @@ class _HomePageState extends State<HomePage> {
     _statsTimer ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
       if (!mounted) return;
       setState(() {
-        _listenPort      = _manager.listenPort;
-        _deviceIP        = _manager.deviceIP;
-        _buffered        = _manager.buffered;
-        _lossRate        = _manager.lossRate;
-        _bitrate         = _manager.bitrateKbps;
-        _rawReceived     = _manager.rawDatagramsReceived;
-        _decoded         = _manager.validPacketsDecoded;
-        _headerInfo      = _manager.lastHeaderInfo;
-        _opusError       = _manager.lastOpusError;
-        _underruns       = _manager.underruns;
-        _frameDurationMs = _manager.frameDurationMs;
-        _rebuffering     = _manager.isRebuffering;
-
-        if (_state == AudioState.buffering) {
-          if (_rawReceived == 0) {
-            _statusMsg = 'Waiting for UDP packets...';
-          } else if (_decoded == 0) {
-            _statusMsg = _headerInfo.isNotEmpty
-                ? 'Opus error! $_headerInfo'
-                : 'Packets received ($_rawReceived) — Opus error!';
-          } else {
-            _statusMsg = 'Buffering... $_decoded/${ReorderBuffer.kPreBufferPackets} '
-                         'packets ($_rawReceived raw)';
-          }
-        }
+        _listenPort = _manager.listenPort;
+        _deviceIP = _manager.deviceIP;
+        _latency = _manager.estimatedLatencyMs;
+        _lossRate = _manager.lossRate;
+        _bitrate = _manager.bitrateKbps;
+        _decoded = _manager.validPacketsDecoded;
+        _opusError = _manager.lastOpusError;
+        _underruns = _manager.underruns;
+        _rebuffering = _manager.isRebuffering;
       });
     });
   }
@@ -120,379 +104,339 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
+  // ── State-dependent copy ───────────────────────────────────────────────
+  String get _headline => switch (_state) {
+        AudioState.stopped   => 'Ready to monitor',
+        AudioState.buffering => 'Pre-buffering…',
+        AudioState.playing   => 'Receiving audio',
+        AudioState.error     => 'Connection lost',
+      };
+
+  String get _subtitle => switch (_state) {
+        AudioState.stopped =>
+          'Tap to start receiving audio from your DAW',
+        AudioState.buffering => 'Building jitter buffer before playback',
+        AudioState.playing =>
+          _deviceIP.isNotEmpty ? 'Studio · $_deviceIP' : 'Streaming live',
+        AudioState.error => _opusError.isNotEmpty
+            ? 'Check DAW plugin — ${_opusError.length > 40 ? '${_opusError.substring(0, 40)}…' : _opusError}'
+            : 'Check the DAW plugin and network',
+      };
+
+  String get _stateLabel => switch (_state) {
+        AudioState.stopped   => 'Stopped',
+        AudioState.buffering => 'Buffering',
+        AudioState.playing   => 'Streaming',
+        AudioState.error     => 'Error',
+      };
 
   @override
   Widget build(BuildContext context) {
-    final bool active = _state != AudioState.stopped;
-    final Color stateColor = switch (_state) {
-      AudioState.stopped   => Colors.grey,
-      AudioState.buffering => Colors.amber,
-      AudioState.playing   => Colors.green,
-      AudioState.error     => Colors.red,
-    };
+    final playing = _state == AudioState.playing;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF1A1A2E),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF16213E),
-        title: const Text('Mix2Go',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-        centerTitle: true,
-      ),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 480),
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                // State indicator dot + label
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Container(
-                      width: 12, height: 12,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle, color: stateColor,
-                        boxShadow: [BoxShadow(color: stateColor.withValues(alpha: .5),
-                            blurRadius: 6, spreadRadius: 2)],
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Text(_statusMsg,
-                        style: const TextStyle(
-                            fontSize: 16, color: Colors.white70)),
-                  ],
+      backgroundColor: Mix2GoTheme.bg,
+      appBar: _appBar(),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 28),
+          child: Column(
+            children: [
+              const SizedBox(height: 12),
+              RepaintBoundary(
+                child: StatusOrb(
+                  state: _state,
+                  buffered: _decoded,
+                  targetBuffer: ReorderBuffer.kPreBufferPackets,
                 ),
-
-                const SizedBox(height: 32),
-
-                // Network info card (visible when active)
-                AnimatedOpacity(
-                  opacity: active ? 1.0 : 0.0,
-                  duration: const Duration(milliseconds: 300),
-                  child: _NetworkInfoCard(
-                    deviceIP:   _deviceIP,
-                    listenPort: _listenPort,
-                  ),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                _headline,
+                style: const TextStyle(
+                  fontFamily: Mix2GoTheme.displayFont,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 26,
+                  letterSpacing: 0.5,
+                  color: Mix2GoTheme.textPrim,
                 ),
-
-                SizedBox(height: active ? 20.0 : 0.0),
-
-                // Start / Stop button
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _toggleStart,
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      backgroundColor: active
-                          ? Colors.red.shade700
-                          : Colors.blue.shade700,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8)),
-                    ),
-                    child: Text(
-                      active ? 'Stop' : 'Start receiving',
-                      style: const TextStyle(
-                          fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _subtitle,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 13, color: Mix2GoTheme.textMuted),
+              ),
+              const SizedBox(height: 26),
+              _mainButton(),
+              const SizedBox(height: 20),
+              if (playing) ...[
+                RepaintBoundary(
+                  child: _panel(
+                    child: ValueListenableBuilder<List<double>>(
+                      valueListenable: _vu,
+                      builder: (context, lv, child) =>
+                          VuMeter(levelL: lv[0], levelR: lv[1]),
                     ),
                   ),
                 ),
-
-                const SizedBox(height: 32),
-
-                // Stats panel (visible when active)
-                AnimatedOpacity(
-                  opacity: active ? 1.0 : 0.0,
-                  duration: const Duration(milliseconds: 300),
-                  child: _StatsPanel(
-                    buffered:        _buffered,
-                    maxBuffer:       ReorderBuffer.kMaxPackets,
-                    lossRate:        _lossRate,
-                    bitrate:         _bitrate,
-                    rawReceived:     _rawReceived,
-                    decoded:         _decoded,
-                    opusError:       _opusError,
-                    underruns:       _underruns,
-                    frameDurationMs: _frameDurationMs,
-                    rebuffering:     _rebuffering,
-                  ),
+                const SizedBox(height: 18),
+                ToggleRow(
+                  icon: Icons.insights_outlined,
+                  label: 'Metrics',
+                  value: _showMetrics,
+                  onTap: () => setState(() => _showMetrics = !_showMetrics),
                 ),
+                const SizedBox(height: 10),
+                ToggleRow(
+                  icon: Icons.lan_outlined,
+                  label: 'Network info',
+                  value: _showNetwork,
+                  onTap: () => setState(() => _showNetwork = !_showNetwork),
+                ),
+                if (_showMetrics) ...[
+                  const SizedBox(height: 14),
+                  _metricsPanel(),
+                ],
+                if (_showNetwork) ...[
+                  const SizedBox(height: 14),
+                  _networkPanel(),
+                ],
               ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── App bar ─────────────────────────────────────────────────────────────
+  PreferredSizeWidget _appBar() {
+    final color = Mix2GoTheme.stateColor(_state);
+    return AppBar(
+      backgroundColor: Mix2GoTheme.surface1,
+      elevation: 0,
+      titleSpacing: 16,
+      title: Row(
+        children: [
+          const SizedBox(
+            width: 26,
+            height: 26,
+            child: CustomPaint(painter: Mix2GoIconPainter(drawBackground: false)),
+          ),
+          const SizedBox(width: 10),
+          _wordmark(),
+        ],
+      ),
+      actions: [
+        Container(
+          margin: const EdgeInsets.only(right: 16),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+          decoration: BoxDecoration(
+            color: Mix2GoTheme.surface2,
+            borderRadius: BorderRadius.circular(99),
+            border: Border.all(color: Mix2GoTheme.borderNorm),
+          ),
+          child: Row(children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+            ),
+            const SizedBox(width: 7),
+            Text(_stateLabel,
+                style: TextStyle(
+                    fontSize: 11, fontWeight: FontWeight.w600, color: color)),
+          ]),
+        ),
+      ],
+    );
+  }
+
+  Widget _wordmark() {
+    const style = TextStyle(
+      fontFamily: Mix2GoTheme.displayFont,
+      fontWeight: FontWeight.w700,
+      fontSize: 20,
+      letterSpacing: 3,
+      color: Colors.white,
+      height: 1,
+    );
+    return Row(children: [
+      const Text('MIX', style: style),
+      ShaderMask(
+        shaderCallback: (b) => Mix2GoTheme.accentGradient.createShader(b),
+        child: const Text('2', style: style),
+      ),
+      const Text('GO', style: style),
+    ]);
+  }
+
+  // ── Main button ─────────────────────────────────────────────────────────
+  Widget _mainButton() {
+    final active = _state != AudioState.stopped && _state != AudioState.error;
+    final label = active
+        ? 'Stop'
+        : (_state == AudioState.error ? 'Retry' : 'Start receiving');
+
+    return SizedBox(
+      width: double.infinity,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: active ? null : Mix2GoTheme.accentGradient,
+          color: active ? Mix2GoTheme.surface2 : null,
+          borderRadius: BorderRadius.circular(14),
+          border: active ? Border.all(color: Mix2GoTheme.borderNorm) : null,
+        ),
+        child: ElevatedButton(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.transparent,
+            shadowColor: Colors.transparent,
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          ),
+          onPressed: _toggleStart,
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              color: active ? Mix2GoTheme.textMuted : Colors.white,
             ),
           ),
         ),
       ),
     );
   }
-}
 
-// ── Network info card ──────────────────────────────────────────────────────────
-// Shows the device IP and auto-assigned port so the user can enter them in the
-// Mix2Go VST as a manual fallback when auto-discovery is blocked by the router.
+  // ── Panels ──────────────────────────────────────────────────────────────
+  Widget _panel({required Widget child}) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Mix2GoTheme.surface1,
+          border: Border.all(color: Mix2GoTheme.borderDim),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: child,
+      );
 
-class _NetworkInfoCard extends StatelessWidget {
-  const _NetworkInfoCard({
-    required this.deviceIP,
-    required this.listenPort,
-  });
+  Color _latencyColor(int ms) => ms < 150
+      ? Mix2GoTheme.stateStreaming
+      : (ms < 250 ? Mix2GoTheme.stateBuffering : Mix2GoTheme.stateError);
+  Color _lossColor(double r) => r < 0.05
+      ? Mix2GoTheme.stateStreaming
+      : (r < 0.15 ? Mix2GoTheme.stateBuffering : Mix2GoTheme.stateError);
 
-  final String deviceIP;
-  final int    listenPort;
+  Widget _metricsPanel() {
+    return _panel(
+      child: Column(children: [
+        _diagRow('Latency', '$_latency ms',
+            color: _latencyColor(_latency),
+            badge: _rebuffering ? 'REBUFFERING' : null),
+        _diagRow('Packet loss', '${(_lossRate * 100).toStringAsFixed(1)} %',
+            color: _lossColor(_lossRate)),
+        _diagRow('Bitrate', '${_bitrate.toStringAsFixed(0)} kbps'),
+        _diagRow('Underruns', '$_underruns',
+            color: _underruns == 0
+                ? Mix2GoTheme.stateStreaming
+                : Mix2GoTheme.stateSearching,
+            last: _opusError.isEmpty),
+        if (_opusError.isNotEmpty)
+          _diagRow('Opus error', _opusError,
+              color: Mix2GoTheme.stateError, last: true),
+      ]),
+    );
+  }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _diagRow(String k, String v,
+      {Color? color, String? badge, bool last = false}) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      padding: const EdgeInsets.symmetric(vertical: 11),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F3460),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.blueAccent.withValues(alpha: .4)),
+        border: last
+            ? null
+            : const Border(
+                bottom: BorderSide(color: Mix2GoTheme.borderDim, width: 1)),
       ),
-      child: Column(
+      child: Row(
         children: [
-          const Text(
-            'Enter in Mix2Go VST:',
-            style: TextStyle(color: Colors.white54, fontSize: 12),
-          ),
-          const SizedBox(height: 8),
-          // Device IP
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Text('IP: ',
-                  style: TextStyle(color: Colors.white54, fontSize: 14)),
-              Text(
-                deviceIP.isNotEmpty ? deviceIP : '...',
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    fontFamily: 'monospace'),
+          Text(k,
+              style: const TextStyle(fontSize: 11, color: Mix2GoTheme.textMuted)),
+          const Spacer(),
+          if (badge != null) ...[
+            Container(
+              margin: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: Mix2GoTheme.stateSearching.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: Mix2GoTheme.stateSearching),
               ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          // Port — shown large so it's easy to read and type
-          Text(
-            listenPort > 0 ? '$listenPort' : '...',
-            style: TextStyle(
-              color: listenPort > 0 ? Colors.lightBlueAccent : Colors.white38,
-              fontSize: 48,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 4,
+              child: Text(badge,
+                  style: const TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                      color: Mix2GoTheme.stateSearching)),
             ),
-          ),
-          const Text(
-            'UDP port',
-            style: TextStyle(color: Colors.white38, fontSize: 11),
+          ],
+          Flexible(
+            child: Text(
+              v,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: color ?? Mix2GoTheme.textPrim,
+              ),
+            ),
           ),
         ],
       ),
     );
   }
-}
 
-// ── Stats panel widget ─────────────────────────────────────────────────────────
-
-class _StatsPanel extends StatelessWidget {
-  const _StatsPanel({
-    required this.buffered,
-    required this.maxBuffer,
-    required this.lossRate,
-    required this.bitrate,
-    required this.rawReceived,
-    required this.decoded,
-    required this.opusError,
-    required this.underruns,
-    required this.frameDurationMs,
-    required this.rebuffering,
-  });
-
-  final int    buffered, maxBuffer, rawReceived, decoded, underruns, frameDurationMs;
-  final double lossRate, bitrate;
-  final String opusError;
-  final bool   rebuffering;
-
-  // hardware avg (T=60ms + F/2=20ms) + Opus frame (10ms) + network (5ms)
-  int get _estimatedLatencyMs => buffered * frameDurationMs + 95;
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _networkPanel() {
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F3460),
-        borderRadius: BorderRadius.circular(12),
+        color: Mix2GoTheme.surface1,
+        border: Border.all(color: Mix2GoTheme.borderDim),
+        borderRadius: BorderRadius.circular(16),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // Latency estimate
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Est. latency',
-                  style: TextStyle(color: Colors.white60, fontSize: 13)),
-              Row(children: [
-                if (rebuffering)
-                  Container(
-                    margin: const EdgeInsets.only(right: 8),
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.withValues(alpha: .2),
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: Colors.orange),
-                    ),
-                    child: const Text('REBUFFERING',
-                        style: TextStyle(color: Colors.orange, fontSize: 10,
-                            fontWeight: FontWeight.bold)),
-                  ),
-                Text('${_estimatedLatencyMs} ms',
-                    style: TextStyle(
-                        color: _estimatedLatencyMs < 150 ? Colors.green
-                            : _estimatedLatencyMs < 250 ? Colors.amber
-                            : Colors.red,
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold)),
-              ]),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Text('jitter ${buffered * frameDurationMs}ms + ~115ms overhead',
-              style: const TextStyle(color: Colors.white30, fontSize: 11)),
-          const SizedBox(height: 12),
-          const Divider(color: Colors.white12, height: 1),
-          const SizedBox(height: 12),
-
-          // Buffer bar
-          _StatRow(
-            label: 'Jitter buffer',
-            value: '$buffered pkts / ${buffered * frameDurationMs}ms',
-            child: LinearProgressIndicator(
-              value: maxBuffer > 0 ? buffered / maxBuffer : 0,
-              backgroundColor: Colors.white12,
-              valueColor: AlwaysStoppedAnimation<Color>(
-                buffered < 4 ? Colors.red : Colors.green),
-            ),
-          ),
-          const SizedBox(height: 12),
-
-          // Loss rate
-          _StatRow(
-            label: 'Packet loss',
-            value: '${(lossRate * 100).toStringAsFixed(1)} %',
-            child: LinearProgressIndicator(
-              value: lossRate.clamp(0.0, 1.0),
-              backgroundColor: Colors.white12,
-              valueColor: AlwaysStoppedAnimation<Color>(
-                lossRate < 0.05 ? Colors.green
-                    : lossRate < 0.15 ? Colors.amber : Colors.red),
-            ),
-          ),
-          const SizedBox(height: 12),
-
-          // FEC underruns
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('FEC underruns',
-                  style: TextStyle(color: Colors.white60, fontSize: 13)),
-              Text('$underruns',
-                  style: TextStyle(
-                      color: underruns == 0 ? Colors.green : Colors.orange,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600)),
-            ],
-          ),
-          const SizedBox(height: 12),
-
-          // Bitrate
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Bitrate',
-                  style: TextStyle(color: Colors.white60, fontSize: 13)),
-              Text('${bitrate.toStringAsFixed(0)} kbps',
-                  style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600)),
-            ],
-          ),
-          const SizedBox(height: 12),
-
-          // Network diagnostic: raw UDP vs decoded Opus
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('UDP raw / decoded',
-                  style: TextStyle(color: Colors.white60, fontSize: 13)),
-              Text(
-                '$rawReceived / $decoded',
-                style: TextStyle(
-                  color: rawReceived == 0
-                      ? Colors.red
-                      : decoded == 0
-                          ? Colors.orange
-                          : Colors.green,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('IP ADDRESS', style: Mix2GoTheme.eyebrow),
+            const SizedBox(height: 4),
+            Text(_deviceIP.isNotEmpty ? _deviceIP : '—',
+                style: Mix2GoTheme.mono.copyWith(fontSize: 15)),
+          ]),
+          Container(width: 1, height: 38, color: Mix2GoTheme.borderNorm),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+            Text('UDP PORT', style: Mix2GoTheme.eyebrow),
+            const SizedBox(height: 2),
+            ShaderMask(
+              shaderCallback: (b) =>
+                  Mix2GoTheme.accentGradient.createShader(b),
+              child: Text(
+                _listenPort > 0 ? '$_listenPort' : '—',
+                style: const TextStyle(
+                  fontFamily: Mix2GoTheme.displayFont,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 28,
+                  letterSpacing: 3,
+                  color: Colors.white,
+                  height: 1,
                 ),
               ),
-            ],
-          ),
-
-          // Show Opus error if present
-          if (opusError.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Text(
-              opusError,
-              style: const TextStyle(
-                color: Colors.orange,
-                fontSize: 11,
-                fontFamily: 'monospace',
-              ),
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
             ),
-          ],
+          ]),
         ],
       ),
-    );
-  }
-}
-
-class _StatRow extends StatelessWidget {
-  const _StatRow({required this.label, required this.value, required this.child});
-  final String label;
-  final String value;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(label,
-                style: const TextStyle(color: Colors.white60, fontSize: 13)),
-            Text(value,
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600)),
-          ],
-        ),
-        const SizedBox(height: 4),
-        child,
-      ],
     );
   }
 }

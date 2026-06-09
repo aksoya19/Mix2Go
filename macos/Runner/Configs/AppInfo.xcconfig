@@ -5,7 +5,7 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = udp_audio_mix2go
+PRODUCT_NAME = Mix2Go
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = com.example.udpAudioMix2go

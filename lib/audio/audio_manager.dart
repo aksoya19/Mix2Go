@@ -100,9 +100,17 @@ class AudioManager {
       StreamController<AudioState>.broadcast();
   final StreamController<String> _logCtrl =
       StreamController<String>.broadcast();
+  // Stereo output level [L, R] (0..1), emitted once per feed callback (~25 Hz)
+  // for the VU meter. Computed in Dart from the decoded PCM — no native code.
+  final StreamController<List<double>> _vuCtrl =
+      StreamController<List<double>>.broadcast();
 
-  Stream<AudioState> get stateStream => _stateCtrl.stream;
-  Stream<String>     get logStream   => _logCtrl.stream;
+  Stream<AudioState>     get stateStream => _stateCtrl.stream;
+  Stream<String>         get logStream   => _logCtrl.stream;
+  Stream<List<double>>   get vuStream    => _vuCtrl.stream;
+
+  // Smoothed VU levels (fast attack, slow release) so the meter looks natural.
+  double _vuL = 0, _vuR = 0;
 
   // ── Core state ─────────────────────────────────────────────────────────────
   bool       _isDisposed   = false;
@@ -189,6 +197,8 @@ class AudioManager {
   bool   get isRebuffering        => _rebuffering;
   int    get underruns            => _underruns;
   int    get frameDurationMs      => _frameDurationMs;
+  // Estimated end-to-end latency: jitter buffer + ~95ms hardware/frame/network.
+  int    get estimatedLatencyMs   => buffered * _frameDurationMs + 95;
   int    get rawDatagramsReceived => _receiver.rawDatagramsReceived;
   int    get validPacketsDecoded  => _receiver.validPacketsDecoded;
   String get lastOpusError        => _receiver.lastOpusError;
@@ -283,6 +293,9 @@ class AudioManager {
     _fadingOut  = false;
     _fadeGain   = 1.0;
 
+    _vuL = 0; _vuR = 0;
+    if (!_vuCtrl.isClosed) _vuCtrl.add(const [0.0, 0.0]);
+
     _updateState(AudioState.stopped);
     _log('Stopped.');
   }
@@ -292,6 +305,7 @@ class AudioManager {
     stop();
     _stateCtrl.close();
     _logCtrl.close();
+    _vuCtrl.close();
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -539,6 +553,8 @@ class AudioManager {
 
     _totalFedMs += _frameDurationMs * kFramesPerFeed;
 
+    _emitVuLevels(out);
+
     // Log once per second.
     if ((_totalFedMs ~/ 1000) >
         ((_totalFedMs - _frameDurationMs * kFramesPerFeed) ~/ 1000)) {
@@ -549,6 +565,44 @@ class AudioManager {
            '${_rebuffering ? " [REBUFFERING]" : ""}');
     }
   }
+
+  /// Computes stereo PEAK amplitude (0..1) from one feed buffer and emits
+  /// smoothed levels for the VU meter — same metric the VST uses, so the phone
+  /// meter matches the DAW. The UI maps peak → dB for the bar. Interleaved
+  /// Int16 [L,R,L,R…] (or mono duplicated).
+  void _emitVuLevels(Int16List out) {
+    if (out.isEmpty) return;
+    final stereo = _numChannels > 1;
+    double peakL = 0, peakR = 0;
+    if (stereo) {
+      for (int i = 0; i + 1 < out.length; i += 2) {
+        final l = out[i].abs() / 32768.0;
+        final r = out[i + 1].abs() / 32768.0;
+        if (l > peakL) peakL = l;
+        if (r > peakR) peakR = r;
+      }
+    } else {
+      for (int i = 0; i < out.length; i++) {
+        final s = out[i].abs() / 32768.0;
+        if (s > peakL) peakL = s;
+      }
+      peakR = peakL;
+    }
+
+    // Fast attack, slow release for a natural meter feel.
+    _vuL = peakL > _vuL ? peakL : _vuL * 0.82;
+    _vuR = peakR > _vuR ? peakR : _vuR * 0.82;
+
+    // Throttle UI emission to ~12 Hz (every 2nd feed). The meter renders only
+    // on these updates (no continuous ticker), so this is the meter's frame
+    // rate. Emitting every feed (~25 Hz) starts to steal time from the feed
+    // callback on the shared Dart thread → underruns. The decay runs every feed.
+    if (++_vuTick >= 2) {
+      _vuTick = 0;
+      if (!_vuCtrl.isClosed) _vuCtrl.add([_vuL, _vuR]);
+    }
+  }
+  int _vuTick = 0;
 
   // ══════════════════════════════════════════════════════════════════════════
   // Adaptive dequeue with clock-drift correction
